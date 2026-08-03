@@ -11,11 +11,15 @@ permissions:
 jobs:
   verify:
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        toolchain: ["1.85.0", "1.97.1"]
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
         with:
-          toolchain: 1.85.0
+          toolchain: ${{ matrix.toolchain }}
           components: rustfmt
       - run: cargo fmt --all -- --check
       - run: cargo check --locked
