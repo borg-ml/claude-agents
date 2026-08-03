@@ -74,10 +74,10 @@ impl ClaudeStreamState {
                 // Agent SDK emits a "system" init message at turn
                 // start with session_id. Capture it; forwarded on
                 // Done so the caller can `resume: session_id` next.
-                if let Some(sid) = value.get("session_id").and_then(Value::as_str)
-                    && !sid.is_empty()
-                {
-                    self.session_id = Some(sid.to_string());
+                if let Some(sid) = value.get("session_id").and_then(Value::as_str) {
+                    if !sid.is_empty() {
+                        self.session_id = Some(sid.to_string());
+                    }
                 }
             }
             "assistant" => {
@@ -282,9 +282,10 @@ impl ClaudeStreamState {
                         // schema and emits the parsed object on `structured_output`. That
                         // value is authoritative. The free-text `result` field may still
                         // carry the raw model output and is only a presentation transcript.
-                        if let Some(structured) = value.get("structured_output")
-                            && !structured.is_null()
-                        {
+                        let structured = value
+                            .get("structured_output")
+                            .filter(|value| !value.is_null());
+                        if let Some(structured) = structured {
                             self.final_text = Some(structured.to_string());
                         } else {
                             self.final_text = value
