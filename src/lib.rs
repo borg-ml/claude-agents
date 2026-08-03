@@ -367,37 +367,37 @@ fn classify_claude_provider_event(value: &Value) -> ProviderEventTelemetry {
             let Some(event) = value.get("event") else {
                 return ProviderEventTelemetry::default();
             };
-            if event.get("type").and_then(Value::as_str) == Some("content_block_delta")
-                && let Some(delta) = event.get("delta")
-            {
-                let (stream_channel, content_text) =
-                    match delta.get("type").and_then(Value::as_str).unwrap_or("") {
-                        "text_delta" => (
-                            Some("assistant_text".to_string()),
-                            delta
-                                .get("text")
-                                .and_then(Value::as_str)
-                                .map(str::to_string),
-                        ),
-                        "thinking_delta" => (
-                            Some("reasoning".to_string()),
-                            delta
-                                .get("thinking")
-                                .and_then(Value::as_str)
-                                .map(str::to_string),
-                        ),
-                        _ => (None, None),
-                    };
-                if stream_channel.is_some() {
-                    return ProviderEventTelemetry {
-                        stream_channel,
-                        content_text,
-                        provider_item_id: event
-                            .get("index")
-                            .and_then(Value::as_i64)
-                            .map(|index| index.to_string()),
-                        ..ProviderEventTelemetry::default()
-                    };
+            if event.get("type").and_then(Value::as_str) == Some("content_block_delta") {
+                if let Some(delta) = event.get("delta") {
+                    let (stream_channel, content_text) =
+                        match delta.get("type").and_then(Value::as_str).unwrap_or("") {
+                            "text_delta" => (
+                                Some("assistant_text".to_string()),
+                                delta
+                                    .get("text")
+                                    .and_then(Value::as_str)
+                                    .map(str::to_string),
+                            ),
+                            "thinking_delta" => (
+                                Some("reasoning".to_string()),
+                                delta
+                                    .get("thinking")
+                                    .and_then(Value::as_str)
+                                    .map(str::to_string),
+                            ),
+                            _ => (None, None),
+                        };
+                    if stream_channel.is_some() {
+                        return ProviderEventTelemetry {
+                            stream_channel,
+                            content_text,
+                            provider_item_id: event
+                                .get("index")
+                                .and_then(Value::as_i64)
+                                .map(|index| index.to_string()),
+                            ..ProviderEventTelemetry::default()
+                        };
+                    }
                 }
             }
             ProviderEventTelemetry {
@@ -854,10 +854,10 @@ impl ControlChannel {
                     // that modify tool arguments.
                     "updatedInput": pending.input,
                 });
-                if decision == ChatApprovalDecision::ApproveSession
-                    && let Some(suggestions) = pending.suggestions
-                {
-                    allow["updatedPermissions"] = suggestions;
+                if decision == ChatApprovalDecision::ApproveSession {
+                    if let Some(suggestions) = pending.suggestions {
+                        allow["updatedPermissions"] = suggestions;
+                    }
                 }
                 allow
             }
@@ -1017,10 +1017,10 @@ fn normalize_elicitation_payload(request: &Value) -> Value {
         ("display_name", "displayName"),
         ("additional_context", "additionalContext"),
     ] {
-        if !object.contains_key(sdk)
-            && let Some(value) = object.remove(wire)
-        {
-            object.insert(sdk.to_string(), value);
+        if !object.contains_key(sdk) {
+            if let Some(value) = object.remove(wire) {
+                object.insert(sdk.to_string(), value);
+            }
         } else {
             object.remove(wire);
         }
@@ -1283,9 +1283,12 @@ pub async fn run(
                         let state_ended = state.handle_message(&value, &tx).await?;
                         if value.get("type").and_then(Value::as_str) == Some("assistant")
                             && !state_ended
-                            && let Err(error) = request_context_usage(&mut channel, &mut stdin).await
                         {
-                            tracing::debug!(%error, "claude context usage request unavailable");
+                            if let Err(error) =
+                                request_context_usage(&mut channel, &mut stdin).await
+                            {
+                                tracing::debug!(%error, "claude context usage request unavailable");
+                            }
                         }
                         if state_ended {
                             stream_ended = true;
@@ -1586,9 +1589,12 @@ async fn run_pooled_native_turn(
                         let state_ended = state.handle_message(&value, tx).await?;
                         if value.get("type").and_then(Value::as_str) == Some("assistant")
                             && !state_ended
-                            && let Err(error) = request_context_usage(&mut channel, &mut pooled.stdin).await
                         {
-                            tracing::debug!(%error, "pooled claude context usage request unavailable");
+                            if let Err(error) =
+                                request_context_usage(&mut channel, &mut pooled.stdin).await
+                            {
+                                tracing::debug!(%error, "pooled claude context usage request unavailable");
+                            }
                         }
                         if let Some(session_id) = state.session_id.as_ref() {
                             pooled.session_id = Some(session_id.clone());

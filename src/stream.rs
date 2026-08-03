@@ -88,11 +88,12 @@ impl ClaudeStreamState {
                 }
                 // Some SDK versions only surface session_id on the
                 // assistant message envelope.
-                if self.session_id.is_none()
-                    && let Some(sid) = value.get("session_id").and_then(Value::as_str)
-                    && !sid.is_empty()
-                {
-                    self.session_id = Some(sid.to_string());
+                if self.session_id.is_none() {
+                    if let Some(sid) = value.get("session_id").and_then(Value::as_str) {
+                        if !sid.is_empty() {
+                            self.session_id = Some(sid.to_string());
+                        }
+                    }
                 }
                 // API failures are delivered as assistant envelopes by the
                 // Agent SDK. Their text is user-facing, but the structured
@@ -140,15 +141,18 @@ impl ClaudeStreamState {
                 {
                     if !self.saw_stream_reasoning {
                         for block in content {
-                            if block.get("type").and_then(Value::as_str) == Some("thinking")
-                                && let Some(thinking) =
+                            if block.get("type").and_then(Value::as_str) == Some("thinking") {
+                                if let Some(thinking) =
                                     block.get("thinking").and_then(Value::as_str)
-                                && tx
-                                    .send(ChatStreamEvent::ReasoningDelta(thinking.to_string()))
-                                    .await
-                                    .is_err()
-                            {
-                                return Ok(true);
+                                {
+                                    if tx
+                                        .send(ChatStreamEvent::ReasoningDelta(thinking.to_string()))
+                                        .await
+                                        .is_err()
+                                    {
+                                        return Ok(true);
+                                    }
+                                }
                             }
                         }
                     }
@@ -161,16 +165,16 @@ impl ClaudeStreamState {
                     // the live bubble.
                     if !self.saw_stream_text {
                         for block in content {
-                            if block.get("type").and_then(Value::as_str) == Some("text")
-                                && let Some(text) = block.get("text").and_then(Value::as_str)
-                            {
-                                self.delta_accumulator.push_str(text);
-                                if tx
-                                    .send(ChatStreamEvent::Delta(text.to_string()))
-                                    .await
-                                    .is_err()
-                                {
-                                    return Ok(true);
+                            if block.get("type").and_then(Value::as_str) == Some("text") {
+                                if let Some(text) = block.get("text").and_then(Value::as_str) {
+                                    self.delta_accumulator.push_str(text);
+                                    if tx
+                                        .send(ChatStreamEvent::Delta(text.to_string()))
+                                        .await
+                                        .is_err()
+                                    {
+                                        return Ok(true);
+                                    }
                                 }
                             }
                         }
