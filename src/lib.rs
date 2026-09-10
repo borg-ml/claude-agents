@@ -1066,7 +1066,6 @@ enum TurnMessageAction {
 #[derive(Debug, Default)]
 struct TurnMessageBoundary {
     live_background_tasks: HashSet<String>,
-    observed_background_work: bool,
     awaiting_post_background_result: bool,
 }
 
@@ -1100,9 +1099,6 @@ impl TurnMessageBoundary {
                             .map(str::to_string)
                     }));
             }
-            if !self.live_background_tasks.is_empty() {
-                self.observed_background_work = true;
-            }
             return TurnMessageAction::Forward;
         }
 
@@ -1125,7 +1121,7 @@ impl TurnMessageBoundary {
             return TurnMessageAction::Suppress;
         }
 
-        if self.observed_background_work {
+        if !self.live_background_tasks.is_empty() {
             self.awaiting_post_background_result = true;
             return TurnMessageAction::Suppress;
         }
@@ -2011,6 +2007,8 @@ while IFS= read -r line; do
       ;;
     *'"type":"user"'*)
       turn=$((turn + 1))
+      printf '{"type":"system","subtype":"background_tasks_changed","tasks":[{"task_id":"test-task"}]}\n'
+      printf '{"type":"system","subtype":"background_tasks_changed","tasks":[]}\n'
       printf '{"type":"system","subtype":"init","session_id":"session-test","capabilities":["interrupt_receipt_v1","interrupt_cancel_queued_v1"]}\n'
       printf '{"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"turn-%s"}}}\n' "$turn"
       printf '{"type":"assistant","session_id":"session-test","message":{"content":[{"type":"text","text":"turn-%s"}],"usage":{"input_tokens":1,"output_tokens":2}}}\n' "$turn"
@@ -2051,31 +2049,35 @@ done
     #[cfg(unix)]
     #[tokio::test(flavor = "current_thread")]
     async fn direct_and_pooled_runtimes_complete_native_stream_json_turns() {
-        let root = tempfile::tempdir().expect("test root");
-        let command = fake_command(root.path());
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            let root = tempfile::tempdir().expect("test root");
+            let command = fake_command(root.path());
 
-        let (tx, rx) = tokio::sync::mpsc::channel(64);
-        run(fake_request(root.path(), command.clone()), tx, None)
+            let (tx, rx) = tokio::sync::mpsc::channel(64);
+            run(fake_request(root.path(), command.clone()), tx, None)
+                .await
+                .expect("direct runtime");
+            assert_eq!(done_text(rx).await, "turn-1");
+
+            let pool = ClaudePool::default();
+            let (tx, rx) = tokio::sync::mpsc::channel(64);
+            run_pooled(
+                fake_request(root.path(), command.clone()),
+                tx,
+                None,
+                pool.clone(),
+            )
             .await
-            .expect("direct runtime");
-        assert_eq!(done_text(rx).await, "turn-1");
+            .expect("first pooled runtime");
+            assert_eq!(done_text(rx).await, "turn-1");
 
-        let pool = ClaudePool::default();
-        let (tx, rx) = tokio::sync::mpsc::channel(64);
-        run_pooled(
-            fake_request(root.path(), command.clone()),
-            tx,
-            None,
-            pool.clone(),
-        )
+            let (tx, rx) = tokio::sync::mpsc::channel(64);
+            run_pooled(fake_request(root.path(), command), tx, None, pool)
+                .await
+                .expect("reused pooled runtime");
+            assert_eq!(done_text(rx).await, "turn-2");
+        })
         .await
-        .expect("first pooled runtime");
-        assert_eq!(done_text(rx).await, "turn-1");
-
-        let (tx, rx) = tokio::sync::mpsc::channel(64);
-        run_pooled(fake_request(root.path(), command), tx, None, pool)
-            .await
-            .expect("reused pooled runtime");
-        assert_eq!(done_text(rx).await, "turn-2");
+        .expect("completed background work must not hold the turn open");
     }
 }
