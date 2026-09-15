@@ -1271,7 +1271,11 @@ impl TurnMessageBoundary {
             // result, the next result at an empty live-task level is the
             // post-notification terminal even when the SDK omits its UUID.
             self.awaiting_post_background_result = false;
-            return TurnMessageAction::Terminal;
+            return if self.follow_up_pending(value) {
+                TurnMessageAction::Forward
+            } else {
+                TurnMessageAction::Terminal
+            };
         }
 
         if !message_belongs_to_turn(value, input_ids) {
@@ -1832,14 +1836,11 @@ async fn apply_in_place_switch(
         if trimmed.is_empty() {
             continue;
         }
-        match channel.handle_frame(Frame::parse(trimmed)?) {
-            Inbound::Response { kind, result } => {
-                expected -= 1;
-                if let ControlOutcome::Error(error) = result {
-                    bail!("claude rejected {kind:?}: {error}");
-                }
+        if let Inbound::Response { kind, result } = channel.handle_frame(Frame::parse(trimmed)?) {
+            expected -= 1;
+            if let ControlOutcome::Error(error) = result {
+                bail!("claude rejected {kind:?}: {error}");
             }
-            _ => {}
         }
     }
     Ok(())
@@ -2351,6 +2352,40 @@ mod tests {
                 TurnMessageAction::Forward
             );
         }
+        assert_eq!(
+            boundary.classify(&result_for("steer"), &inputs),
+            TurnMessageAction::Terminal
+        );
+    }
+
+    #[test]
+    fn background_completion_does_not_end_a_pending_steer() {
+        let mut boundary = TurnMessageBoundary::default();
+        boundary.note_input("prompt");
+        let inputs = HashSet::from(["prompt".to_string(), "steer".to_string()]);
+        boundary.classify(&lifecycle("prompt", "started"), &inputs);
+        boundary.classify(
+            &json!({"type": "system", "subtype": "background_tasks_changed",
+                "tasks": [{"task_id": "task"}]}),
+            &inputs,
+        );
+        assert_eq!(
+            boundary.classify(&result_for("prompt"), &inputs),
+            TurnMessageAction::Suppress
+        );
+        boundary.classify(&lifecycle("prompt", "completed"), &inputs);
+        boundary.note_input("steer");
+        boundary.classify(&lifecycle("steer", "queued"), &inputs);
+        boundary.classify(
+            &json!({"type": "system", "subtype": "background_tasks_changed", "tasks": []}),
+            &inputs,
+        );
+        assert_eq!(
+            boundary.classify(&result_for("task-notification"), &inputs),
+            TurnMessageAction::Forward,
+            "background completion must not orphan the pending human message"
+        );
+        boundary.classify(&lifecycle("steer", "started"), &inputs);
         assert_eq!(
             boundary.classify(&result_for("steer"), &inputs),
             TurnMessageAction::Terminal
