@@ -102,6 +102,12 @@ pub enum ChatStreamControl {
         /// caller correlate consumption exactly. A fresh uuid is minted when
         /// absent.
         message_id: Option<String>,
+        /// Deliver as a priority `now` message: Claude Code (2.1.272+) ends the
+        /// running turn after the tool in flight (shell work is backgrounded,
+        /// not killed), then runs this message as its own turn so it is
+        /// answered immediately instead of after the current task. Older CLIs
+        /// ignore the field and fold the message in at the next boundary.
+        preempt: bool,
         ack: tokio::sync::oneshot::Sender<Result<(), String>>,
     },
     Approval {
@@ -1092,6 +1098,11 @@ fn result_answered_ids(value: &Value) -> Vec<&str> {
     ids
 }
 
+/// Mark a stdin user message as priority `now` (see `ChatStreamControl::Steer::preempt`).
+fn stamp_priority_now(message: &mut Value) {
+    message["priority"] = Value::String("now".to_string());
+}
+
 fn message_belongs_to_turn(value: &Value, input_ids: &HashSet<String>) -> bool {
     if value.get("type").and_then(Value::as_str) != Some("result") {
         return true;
@@ -2059,6 +2070,7 @@ fn queue_or_reject_native_control(pooled: &mut PooledClaudeNative, control: Chat
             text,
             attachments,
             message_id,
+            preempt: _,
             ack,
         } => {
             let (input_id, message) =
@@ -2141,10 +2153,14 @@ async fn apply_control(
             text,
             attachments,
             message_id,
+            preempt,
             ack,
         } => {
-            let (input_id, message) =
+            let (input_id, mut message) =
                 user_message_with_explicit_id(&prompt_text(&text, &attachments), message_id);
+            if preempt {
+                stamp_priority_now(&mut message);
+            }
             let result = write_line(stdin, &message).await;
             if result.is_ok() {
                 input_ids.insert(input_id);
@@ -2487,6 +2503,15 @@ mod tests {
         other.args.push("--permission-mode".into());
         assert_eq!(in_place_switch(&base, &other), None);
         assert_eq!(in_place_switch(&base, &base), None);
+    }
+
+    #[test]
+    fn preempting_steers_are_stamped_priority_now() {
+        let (_, mut message) = user_message_with_explicit_id("hi", None);
+        assert!(message.get("priority").is_none());
+        stamp_priority_now(&mut message);
+        assert_eq!(message["priority"], "now");
+        assert_eq!(message["type"], "user");
     }
 
     #[test]
