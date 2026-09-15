@@ -1127,8 +1127,9 @@ enum InputLifecycle {
     /// The CLI is processing it (injected at a tool boundary, or running as
     /// its own follow-up command after the previous `result`).
     Started,
-    /// completed / failed / cancelled / error.
+    /// completed / failed / error.
     Final,
+    Cancelled,
 }
 
 #[derive(Debug, Default)]
@@ -1221,7 +1222,8 @@ impl TurnMessageBoundary {
             "started" => InputLifecycle::Started,
             // `refused`: a cross-session message the receive-side policy
             // declined (2.1.238+). Terminal like the others.
-            "completed" | "failed" | "cancelled" | "error" | "refused" => InputLifecycle::Final,
+            "cancelled" => InputLifecycle::Cancelled,
+            "completed" | "failed" | "error" | "refused" => InputLifecycle::Final,
             _ => return,
         };
     }
@@ -1243,6 +1245,33 @@ impl TurnMessageBoundary {
                     InputLifecycle::Written | InputLifecycle::Queued | InputLifecycle::Started
                 )
         })
+    }
+
+    fn pending_result_action(&self, result: &Value) -> TurnMessageAction {
+        let cancelled = result_answered_ids(result)
+            .iter()
+            .any(|id| self.inputs.get(*id) == Some(&InputLifecycle::Cancelled));
+        let no_error_detail = ["result", "error"].iter().all(|key| {
+            result
+                .get(key)
+                .and_then(Value::as_str)
+                .is_none_or(str::is_empty)
+        }) && result
+            .get("errors")
+            .and_then(Value::as_array)
+            .is_none_or(Vec::is_empty);
+        if result.get("subtype").and_then(Value::as_str) == Some("error_during_execution")
+            && (matches!(
+                result.get("terminal_reason").and_then(Value::as_str),
+                Some("aborted_streaming" | "aborted_tools")
+            ) || (cancelled && no_error_detail))
+        {
+            // A priority-now steer cancels the old command, not this stream.
+            // Do not let its intermediate abort fail the pending human input.
+            TurnMessageAction::Suppress
+        } else {
+            TurnMessageAction::Forward
+        }
     }
 
     fn classify(&mut self, value: &Value, input_ids: &HashSet<String>) -> TurnMessageAction {
@@ -1272,7 +1301,7 @@ impl TurnMessageBoundary {
             // post-notification terminal even when the SDK omits its UUID.
             self.awaiting_post_background_result = false;
             return if self.follow_up_pending(value) {
-                TurnMessageAction::Forward
+                self.pending_result_action(value)
             } else {
                 TurnMessageAction::Terminal
             };
@@ -1293,7 +1322,7 @@ impl TurnMessageBoundary {
         self.awaiting_post_background_result = false;
         if self.follow_up_pending(value) {
             // The reply to a queued steer is still coming; keep reading.
-            return TurnMessageAction::Forward;
+            return self.pending_result_action(value);
         }
         TurnMessageAction::Terminal
     }
@@ -2356,6 +2385,63 @@ mod tests {
             boundary.classify(&result_for("steer"), &inputs),
             TurnMessageAction::Terminal
         );
+    }
+
+    #[tokio::test]
+    async fn cancelled_result_does_not_fail_a_pending_steer() {
+        for reason in [None, Some("aborted_tools"), Some("aborted_streaming")] {
+            let mut boundary = TurnMessageBoundary::default();
+            let mut stream = crate::stream::ClaudeStreamState::default();
+            let (tx, mut rx) = tokio::sync::mpsc::channel(16);
+            boundary.note_input("prompt");
+            boundary.note_input("steer");
+            let inputs = HashSet::from(["prompt".to_string(), "steer".to_string()]);
+            let mut aborted = result_for("prompt");
+            aborted["subtype"] = json!("error_during_execution");
+            aborted.as_object_mut().unwrap().remove("result");
+            if let Some(reason) = reason {
+                aborted["terminal_reason"] = json!(reason);
+            }
+            for frame in [
+                lifecycle("prompt", "started"),
+                lifecycle("steer", "queued"),
+                lifecycle("prompt", "cancelled"),
+                aborted.clone(),
+                lifecycle("steer", "started"),
+                result_for("steer"),
+            ] {
+                let action = boundary.classify(&frame, &inputs);
+                if action != TurnMessageAction::Suppress {
+                    assert!(
+                        !stream.handle_message(&frame, &tx).await.unwrap(),
+                        "{frame}"
+                    );
+                }
+            }
+            assert_eq!(stream.final_text.as_deref(), Some("ok"));
+            assert!(!stream.emitted_failure);
+            while let Ok(event) = rx.try_recv() {
+                assert!(!matches!(event, ChatStreamEvent::Failed { .. }));
+            }
+            let mut failure = aborted.clone();
+            failure.as_object_mut().unwrap().remove("terminal_reason");
+            failure["errors"] = json!(["permission denied"]);
+            assert_eq!(
+                boundary.classify(&failure, &inputs),
+                TurnMessageAction::Forward
+            );
+            let mut failed_stream = crate::stream::ClaudeStreamState::default();
+            assert!(failed_stream.handle_message(&failure, &tx).await.unwrap());
+            assert!(
+                matches!(rx.try_recv().unwrap(), ChatStreamEvent::Failed { error } if error.contains("permission denied"))
+            );
+            // Without a pending follow-up, even cancellation is terminal.
+            boundary.classify(&lifecycle("steer", "completed"), &inputs);
+            assert_eq!(
+                boundary.classify(&aborted, &inputs),
+                TurnMessageAction::Terminal
+            );
+        }
     }
 
     #[test]
