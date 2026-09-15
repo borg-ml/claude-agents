@@ -326,10 +326,22 @@ impl ClaudeStreamState {
                                     .map(ToString::to_string)
                             })
                             .unwrap_or_else(|| format!("claude SDK returned subtype={subtype}"));
+                        // Carry the structured fields (2.1.218+/2.1.223+) as
+                        // the same `"key":value` tokens the `error` frame uses,
+                        // so callers classify overload/rate-limit terminations
+                        // without matching prose.
+                        let mut parts = vec![format!("claude SDK {subtype}: {error}")];
+                        if let Some(reason) = value.get("terminal_reason").and_then(Value::as_str) {
+                            parts.push(format!(r#""terminal_reason":"{reason}""#));
+                        }
+                        if let Some(status) = value.get("api_error_status").and_then(Value::as_u64)
+                        {
+                            parts.push(format!(r#""status":{status}"#));
+                        }
                         self.emitted_failure = true;
                         let _ = tx
                             .send(ChatStreamEvent::Failed {
-                                error: format!("claude SDK {subtype}: {error}"),
+                                error: parts.join(" "),
                             })
                             .await;
                         return Ok(true);

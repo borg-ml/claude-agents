@@ -16,7 +16,7 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
 mod stream;
 
 /// A fully configured Claude Code child command.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CommandSpec {
     pub program: PathBuf,
     pub args: Vec<String>,
@@ -306,9 +306,24 @@ fn extract_claude_usage(envelope: &Value) -> ProviderCallUsage {
         .saturating_add(cached_input_tokens)
         .saturating_add(cache_creation_input_tokens)
         .saturating_add(output_tokens);
+    // `total_cost_usd` is the cumulative session cost. `modelUsage` is the
+    // SDK's designated cost-accounting field (cumulative, every pipeline call,
+    // per model); fall back to its sum when the total is absent.
     let cost_microusd = envelope
         .get("total_cost_usd")
         .and_then(Value::as_f64)
+        .or_else(|| {
+            envelope
+                .get("modelUsage")
+                .and_then(Value::as_object)
+                .map(|models| {
+                    models
+                        .values()
+                        .filter_map(|model| model.get("costUSD").and_then(Value::as_f64))
+                        .sum::<f64>()
+                })
+                .filter(|total| *total > 0.0)
+        })
         .and_then(provider_cost_usd_to_microusd);
     ProviderCallUsage {
         duration_ms: envelope
@@ -700,6 +715,8 @@ pub(crate) enum OutboundKind {
     CancelAsyncMessage,
     StopTask,
     ContextUsage,
+    SetModel,
+    ApplyFlagSettings,
 }
 
 #[derive(Debug, Default)]
@@ -1057,15 +1074,30 @@ fn user_message_with_explicit_id(text: &str, id: Option<String>) -> (String, Val
     (id, message)
 }
 
+/// Every user message a `result` says it answered: `user_message_uuids`
+/// (2.1.259+, one entry per merged message) plus the singular
+/// `user_message_uuid` older CLIs emit.
+fn result_answered_ids(value: &Value) -> Vec<&str> {
+    let mut ids: Vec<&str> = value
+        .get("user_message_uuids")
+        .and_then(Value::as_array)
+        .map(|items| items.iter().filter_map(Value::as_str).collect())
+        .unwrap_or_default();
+    if let Some(id) = value.get("user_message_uuid").and_then(Value::as_str)
+        && !id.is_empty()
+        && !ids.contains(&id)
+    {
+        ids.push(id);
+    }
+    ids
+}
+
 fn message_belongs_to_turn(value: &Value, input_ids: &HashSet<String>) -> bool {
     if value.get("type").and_then(Value::as_str) != Some("result") {
         return true;
     }
-    value
-        .get("user_message_uuid")
-        .and_then(Value::as_str)
-        .filter(|id| !id.is_empty())
-        .is_none_or(|id| input_ids.contains(id))
+    let answered = result_answered_ids(value);
+    answered.is_empty() || answered.iter().any(|id| input_ids.contains(*id))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1099,6 +1131,41 @@ struct TurnMessageBoundary {
     /// Whether this CLI emits `command_lifecycle` at all. Older builds do not;
     /// for them a `result` stays terminal on its own.
     lifecycle_observed: bool,
+}
+
+/// `--mcp-config` entries the CLI skipped during validation (2.1.219+),
+/// reported on the `system/init` frame. Callers usually depend on those
+/// servers for their tools, so this must not stay silent.
+fn init_mcp_server_errors(value: &Value) -> Option<Vec<Value>> {
+    if value.get("type").and_then(Value::as_str) != Some("system")
+        || value.get("subtype").and_then(Value::as_str) != Some("init")
+    {
+        return None;
+    }
+    value
+        .get("mcp_server_errors")
+        .and_then(Value::as_array)
+        .filter(|errors| !errors.is_empty())
+        .cloned()
+}
+
+async fn report_mcp_server_errors(tx: &tokio::sync::mpsc::Sender<ChatStreamEvent>, value: &Value) {
+    let Some(errors) = init_mcp_server_errors(value) else {
+        return;
+    };
+    tracing::warn!(?errors, "claude skipped MCP servers from --mcp-config");
+    let _ = tx
+        .send(ChatStreamEvent::ProviderEvent {
+            kind: "claude.mcp_server_errors".to_string(),
+            payload: serde_json::json!({"type": "mcp_server_errors", "errors": errors}),
+            raw_payload: Some(value.clone()),
+            stream_channel: None,
+            content_text: None,
+            provider_item_id: None,
+            tool_use_id: None,
+            tool_name: None,
+        })
+        .await;
 }
 
 fn capture_init_capabilities(value: &Value, capabilities: &mut HashSet<String>) {
@@ -1141,7 +1208,9 @@ impl TurnMessageBoundary {
         *lifecycle = match state {
             "queued" => InputLifecycle::Queued,
             "started" => InputLifecycle::Started,
-            "completed" | "failed" | "cancelled" | "error" => InputLifecycle::Final,
+            // `refused`: a cross-session message the receive-side policy
+            // declined (2.1.238+). Terminal like the others.
+            "completed" | "failed" | "cancelled" | "error" | "refused" => InputLifecycle::Final,
             _ => return,
         };
     }
@@ -1155,12 +1224,9 @@ impl TurnMessageBoundary {
         if !self.lifecycle_observed {
             return false;
         }
-        let answered = result
-            .get("user_message_uuid")
-            .and_then(Value::as_str)
-            .unwrap_or_default();
+        let answered = result_answered_ids(result);
         self.inputs.iter().any(|(input_id, lifecycle)| {
-            input_id != answered
+            !answered.contains(&input_id.as_str())
                 && matches!(
                     lifecycle,
                     InputLifecycle::Written | InputLifecycle::Queued | InputLifecycle::Started
@@ -1238,7 +1304,10 @@ async fn request_context_usage(
         stdin,
         &serde_json::to_value(OutboundControlRequest::new(
             &request_id,
-            serde_json::json!({"subtype": "get_context_usage"}),
+            // `summary` answers from the last response's usage and local
+            // estimates; `full` (the default) makes per-category token-count
+            // API calls, which is too expensive after every assistant message.
+            serde_json::json!({"subtype": "get_context_usage", "detail": "summary"}),
         ))?,
     )
     .await;
@@ -1359,6 +1428,7 @@ pub async fn run(
                 match Frame::parse(trimmed)? {
                     Frame::Message(value) => {
                         capture_init_capabilities(&value, &mut capabilities);
+                        report_mcp_server_errors(&tx, &value).await;
                         let action = turn_boundary.classify(&value, &input_ids);
                         if action == TurnMessageAction::Suppress {
                             continue;
@@ -1497,6 +1567,70 @@ struct PooledClaudeNative {
     capabilities: HashSet<String>,
     session_id: Option<String>,
     pending_steers: Vec<(String, Value)>,
+    /// The command line the process was spawned with, updated when a model or
+    /// effort switch is applied in place.
+    command: CommandSpec,
+}
+
+/// Values of `--model` / `--effort` in a Claude command line.
+fn command_model_and_effort(args: &[String]) -> (Option<&str>, Option<&str>) {
+    let mut model = None;
+    let mut effort = None;
+    let mut iter = args.iter();
+    while let Some(arg) = iter.next() {
+        match arg.as_str() {
+            "--model" => model = iter.next().map(String::as_str),
+            "--effort" => effort = iter.next().map(String::as_str),
+            _ => {}
+        }
+    }
+    (model, effort)
+}
+
+/// The command line with `--model` / `--effort` (and their values) removed.
+fn command_without_model_and_effort(args: &[String]) -> Vec<&str> {
+    let mut rest = Vec::new();
+    let mut iter = args.iter();
+    while let Some(arg) = iter.next() {
+        if arg == "--model" || arg == "--effort" {
+            iter.next();
+            continue;
+        }
+        rest.push(arg.as_str());
+    }
+    rest
+}
+
+/// A requested model/effort change that can be applied to a live pooled
+/// process with `set_model` / `apply_flag_settings` instead of a respawn.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct InPlaceSwitch {
+    pub(crate) model: Option<String>,
+    pub(crate) effort: Option<String>,
+}
+
+/// `Some` when `next` differs from `current` only in `--model` / `--effort`.
+/// Anything else (permissions, MCP config, cwd, environment) needs a fresh
+/// process.
+pub(crate) fn in_place_switch(current: &CommandSpec, next: &CommandSpec) -> Option<InPlaceSwitch> {
+    if current == next {
+        return None;
+    }
+    if current.program != next.program
+        || current.current_dir != next.current_dir
+        || current.environment != next.environment
+        || current.environment_remove != next.environment_remove
+        || command_without_model_and_effort(&current.args)
+            != command_without_model_and_effort(&next.args)
+    {
+        return None;
+    }
+    let (current_model, current_effort) = command_model_and_effort(&current.args);
+    let (next_model, next_effort) = command_model_and_effort(&next.args);
+    Some(InPlaceSwitch {
+        model: (current_model != next_model).then(|| next_model.unwrap_or("default").to_string()),
+        effort: (current_effort != next_effort).then(|| next_effort.unwrap_or("").to_string()),
+    })
 }
 
 async fn start_pooled_native(req: &ChatStreamRequest) -> Result<PooledClaudeNative> {
@@ -1544,6 +1678,7 @@ async fn start_pooled_native(req: &ChatStreamRequest) -> Result<PooledClaudeNati
         capabilities: HashSet::new(),
         session_id: None,
         pending_steers: Vec::new(),
+        command: req.command.clone(),
     })
 }
 
@@ -1557,7 +1692,36 @@ pub async fn run_pooled(
 ) -> Result<()> {
     let mut guard = pool.inner.lock().await;
     let mut pooled = match guard.take() {
-        Some(pooled) if pooled.lifecycle_key == req.lifecycle_key => pooled,
+        Some(mut pooled) if pooled.lifecycle_key == req.lifecycle_key => {
+            match in_place_switch(&pooled.command, &req.command) {
+                None if pooled.command == req.command => pooled,
+                Some(switch) => match apply_in_place_switch(&mut pooled, &switch).await {
+                    Ok(()) => {
+                        pooled.command = req.command.clone();
+                        pooled
+                    }
+                    Err(error) => {
+                        tracing::warn!(%error, "in-place Claude model switch failed; respawning");
+                        let mut pending_steers = Vec::new();
+                        transfer_pending_steers(&mut pooled.pending_steers, &mut pending_steers);
+                        let _ = pooled.child.kill().await;
+                        let mut fresh = start_pooled_native(&req).await?;
+                        fresh.pending_steers = pending_steers;
+                        fresh
+                    }
+                },
+                None => {
+                    // Same lifecycle but a different command line (permissions,
+                    // MCP config, environment): only a fresh process honours it.
+                    let mut pending_steers = Vec::new();
+                    transfer_pending_steers(&mut pooled.pending_steers, &mut pending_steers);
+                    let _ = pooled.child.kill().await;
+                    let mut fresh = start_pooled_native(&req).await?;
+                    fresh.pending_steers = pending_steers;
+                    fresh
+                }
+            }
+        }
         Some(mut stale) => {
             let mut pending_steers = Vec::new();
             transfer_pending_steers(&mut stale.pending_steers, &mut pending_steers);
@@ -1588,6 +1752,84 @@ pub async fn run_pooled(
         *guard = Some(pooled);
     } else {
         let _ = pooled.child.kill().await;
+    }
+    Ok(())
+}
+
+/// Switch a live pooled process to a new model and/or effort with the CLI's
+/// `set_model` / `apply_flag_settings` control requests (2.1.212+ applies them
+/// to the next model round-trip). Runs between turns, so the only frames the
+/// CLI emits meanwhile are the control responses; anything else is forwarded
+/// nowhere and simply skipped.
+async fn apply_in_place_switch(
+    pooled: &mut PooledClaudeNative,
+    switch: &InPlaceSwitch,
+) -> Result<()> {
+    let mut channel = ControlChannel::new();
+    let mut expected = 0usize;
+    if let Some(model) = switch.model.as_deref() {
+        let request_id = format!("claude-agents-set-model-{}", uuid::Uuid::new_v4());
+        channel.begin_request(&request_id, OutboundKind::SetModel);
+        let model = if model.is_empty() || model == "default" {
+            Value::Null
+        } else {
+            Value::String(model.to_string())
+        };
+        write_line(
+            &mut pooled.stdin,
+            &serde_json::to_value(OutboundControlRequest::new(
+                &request_id,
+                serde_json::json!({"subtype": "set_model", "model": model}),
+            ))?,
+        )
+        .await?;
+        expected += 1;
+    }
+    if let Some(effort) = switch.effort.as_deref() {
+        let request_id = format!("claude-agents-effort-{}", uuid::Uuid::new_v4());
+        channel.begin_request(&request_id, OutboundKind::ApplyFlagSettings);
+        let effort = if effort.is_empty() {
+            Value::Null
+        } else {
+            Value::String(effort.to_string())
+        };
+        write_line(
+            &mut pooled.stdin,
+            &serde_json::to_value(OutboundControlRequest::new(
+                &request_id,
+                serde_json::json!({
+                    "subtype": "apply_flag_settings",
+                    "settings": {"effortLevel": effort}
+                }),
+            ))?,
+        )
+        .await?;
+        expected += 1;
+    }
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+    let mut line = String::new();
+    while expected > 0 {
+        line.clear();
+        let read = tokio::time::timeout_at(deadline, pooled.stdout.read_line(&mut line))
+            .await
+            .context("timed out waiting for the Claude model switch response")?
+            .context("failed reading pooled claude stdout")?;
+        if read == 0 {
+            bail!("pooled claude exited during a model switch");
+        }
+        let trimmed = line.trim_end_matches(['\r', '\n']);
+        if trimmed.is_empty() {
+            continue;
+        }
+        match channel.handle_frame(Frame::parse(trimmed)?) {
+            Inbound::Response { kind, result } => {
+                expected -= 1;
+                if let ControlOutcome::Error(error) = result {
+                    bail!("claude rejected {kind:?}: {error}");
+                }
+            }
+            _ => {}
+        }
     }
     Ok(())
 }
@@ -1670,6 +1912,7 @@ async fn run_pooled_native_turn(
                 match Frame::parse(trimmed)? {
                     Frame::Message(value) => {
                         capture_init_capabilities(&value, &mut pooled.capabilities);
+                        report_mcp_server_errors(tx, &value).await;
                         let action = turn_boundary.classify(&value, &input_ids);
                         if action == TurnMessageAction::Suppress {
                             continue;
@@ -1876,6 +2119,7 @@ async fn handle_control_response(
                 })
                 .await;
         }
+        (OutboundKind::SetModel | OutboundKind::ApplyFlagSettings, ControlOutcome::Success(_)) => {}
         (kind, ControlOutcome::Error(error)) => {
             tracing::warn!(?kind, %error, "claude control request failed");
         }
@@ -2134,6 +2378,118 @@ mod tests {
     }
 
     #[test]
+    fn result_answered_ids_merge_plural_and_singular_uuids() {
+        let both =
+            json!({"type": "result", "user_message_uuid": "a", "user_message_uuids": ["a", "b"]});
+        assert_eq!(result_answered_ids(&both), vec!["a", "b"]);
+        let folded = json!({"type": "result", "user_message_uuid": "prompt", "user_message_uuids": ["prompt", "steer"]});
+        let mut boundary = TurnMessageBoundary::default();
+        boundary.note_input("prompt");
+        boundary.note_input("steer");
+        let inputs = HashSet::from(["prompt".to_string(), "steer".to_string()]);
+        for frame in [lifecycle("prompt", "started"), lifecycle("steer", "queued")] {
+            boundary.classify(&frame, &inputs);
+        }
+        assert_eq!(
+            boundary.classify(&folded, &inputs),
+            TurnMessageAction::Terminal,
+            "a result that names the steer among the answered messages ends the turn"
+        );
+    }
+
+    #[test]
+    fn refused_steers_settle_the_turn() {
+        let mut boundary = TurnMessageBoundary::default();
+        boundary.note_input("prompt");
+        boundary.note_input("steer");
+        let inputs = HashSet::from(["prompt".to_string(), "steer".to_string()]);
+        for frame in [
+            lifecycle("prompt", "started"),
+            lifecycle("steer", "queued"),
+            lifecycle("steer", "refused"),
+        ] {
+            boundary.classify(&frame, &inputs);
+        }
+        assert_eq!(
+            boundary.classify(&result_for("prompt"), &inputs),
+            TurnMessageAction::Terminal
+        );
+    }
+
+    #[test]
+    fn usage_cost_falls_back_to_model_usage() {
+        let usage = extract_usage(&json!({
+            "type": "result",
+            "usage": {"input_tokens": 1, "output_tokens": 1},
+            "modelUsage": {"m1": {"costUSD": 0.25}, "m2": {"costUSD": 0.5}}
+        }));
+        assert_eq!(usage.cost_microusd, Some(750_000));
+        let total_wins = extract_usage(
+            &json!({"type": "result", "total_cost_usd": 0.1, "modelUsage": {"m1": {"costUSD": 9.0}}}),
+        );
+        assert_eq!(total_wins.cost_microusd, Some(100_000));
+    }
+
+    #[test]
+    fn init_mcp_server_errors_are_extracted_only_when_present() {
+        assert!(
+            init_mcp_server_errors(
+                &json!({"type": "system", "subtype": "init", "mcp_server_errors": []})
+            )
+            .is_none()
+        );
+        let errors = init_mcp_server_errors(
+            &json!({"type": "system", "subtype": "init", "mcp_server_errors": [{"name": "borg", "error": "bad config"}]}),
+        );
+        assert_eq!(errors.map(|e| e.len()), Some(1));
+        assert!(
+            init_mcp_server_errors(
+                &json!({"type": "system", "subtype": "status", "mcp_server_errors": [1]})
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn in_place_switch_only_covers_model_and_effort() {
+        let base = CommandSpec {
+            program: "claude".into(),
+            args: vec![
+                "--print".into(),
+                "--model".into(),
+                "a".into(),
+                "--effort".into(),
+                "low".into(),
+            ],
+            current_dir: "/tmp".into(),
+            environment: Vec::new(),
+            environment_remove: Vec::new(),
+        };
+        let mut model_only = base.clone();
+        model_only.args[2] = "b".into();
+        assert_eq!(
+            in_place_switch(&base, &model_only),
+            Some(InPlaceSwitch {
+                model: Some("b".into()),
+                effort: None
+            })
+        );
+        let mut effort_only = base.clone();
+        effort_only.args[4] = "high".into();
+        assert_eq!(
+            in_place_switch(&base, &effort_only),
+            Some(InPlaceSwitch {
+                model: None,
+                effort: Some("high".into())
+            })
+        );
+        let mut other = base.clone();
+        other.args.push("--permission-mode".into());
+        assert_eq!(in_place_switch(&base, &other), None);
+        assert_eq!(in_place_switch(&base, &base), None);
+    }
+
+    #[test]
     fn explicit_steer_ids_are_stamped_on_the_stdin_message() {
         let (id, message) = user_message_with_explicit_id("hi", Some("borg-msg-1".into()));
         assert_eq!(id, "borg-msg-1");
@@ -2191,6 +2547,10 @@ while IFS= read -r line; do
     *'"subtype":"initialize"'*)
       request_id=$(printf '%s\n' "$line" | sed -n 's/.*"request_id":"\([^"]*\)".*/\1/p')
       printf '{"type":"control_response","response":{"subtype":"success","request_id":"%s","response":{"capabilities":["interrupt_receipt_v1","interrupt_cancel_queued_v1"]}}}\n' "$request_id"
+      ;;
+    *'"subtype":"set_model"'*|*'"subtype":"apply_flag_settings"'*)
+      request_id=$(printf '%s\n' "$line" | sed -n 's/.*"request_id":"\([^"]*\)".*/\1/p')
+      printf '{"type":"control_response","response":{"subtype":"success","request_id":"%s","response":{}}}\n' "$request_id"
       ;;
     *'"subtype":"get_context_usage"'*)
       request_id=$(printf '%s\n' "$line" | sed -n 's/.*"request_id":"\([^"]*\)".*/\1/p')
@@ -2263,10 +2623,31 @@ done
             assert_eq!(done_text(rx).await, "turn-1");
 
             let (tx, rx) = tokio::sync::mpsc::channel(64);
-            run_pooled(fake_request(root.path(), command), tx, None, pool)
-                .await
-                .expect("reused pooled runtime");
+            run_pooled(
+                fake_request(root.path(), command.clone()),
+                tx,
+                None,
+                pool.clone(),
+            )
+            .await
+            .expect("reused pooled runtime");
             assert_eq!(done_text(rx).await, "turn-2");
+
+            // A model/effort change is applied to the live process with
+            // control requests instead of a respawn: the turn counter keeps
+            // counting.
+            let mut switched = command;
+            switched.args.extend([
+                "--model".to_string(),
+                "other-model".to_string(),
+                "--effort".to_string(),
+                "high".to_string(),
+            ]);
+            let (tx, rx) = tokio::sync::mpsc::channel(64);
+            run_pooled(fake_request(root.path(), switched), tx, None, pool)
+                .await
+                .expect("switched pooled runtime");
+            assert_eq!(done_text(rx).await, "turn-3");
         })
         .await
         .expect("completed background work must not hold the turn open");
