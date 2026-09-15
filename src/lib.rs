@@ -96,6 +96,12 @@ pub enum ChatStreamControl {
     Steer {
         text: String,
         attachments: Vec<PathBuf>,
+        /// Caller-owned id stamped on the stdin user message as its `uuid`.
+        /// Claude Code echoes it back as `command_uuid` on `command_lifecycle`
+        /// frames and as `user_message_uuid` on the `result`, which lets the
+        /// caller correlate consumption exactly. A fresh uuid is minted when
+        /// absent.
+        message_id: Option<String>,
         ack: tokio::sync::oneshot::Sender<Result<(), String>>,
     },
     Approval {
@@ -1034,7 +1040,13 @@ pub fn user_message(text: &str) -> Value {
 }
 
 fn user_message_with_id(text: &str) -> (String, Value) {
-    let id = uuid::Uuid::new_v4().to_string();
+    user_message_with_explicit_id(text, None)
+}
+
+fn user_message_with_explicit_id(text: &str, id: Option<String>) -> (String, Value) {
+    let id = id
+        .filter(|id| !id.trim().is_empty())
+        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
     let message = serde_json::json!({
         "type": "user",
         "message": {"role": "user", "content": [{"type": "text", "text": text}]},
@@ -1063,10 +1075,30 @@ enum TurnMessageAction {
     Terminal,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InputLifecycle {
+    /// Written to stdin; the CLI has not announced it yet.
+    Written,
+    /// The CLI queued it behind the running command.
+    Queued,
+    /// The CLI is processing it (injected at a tool boundary, or running as
+    /// its own follow-up command after the previous `result`).
+    Started,
+    /// completed / failed / cancelled / error.
+    Final,
+}
+
 #[derive(Debug, Default)]
 struct TurnMessageBoundary {
     live_background_tasks: HashSet<String>,
     awaiting_post_background_result: bool,
+    /// Lifecycle of every user message this turn wrote to the CLI, keyed by
+    /// the uuid we stamped on it. Claude Code echoes that uuid back as
+    /// `command_uuid` on its `command_lifecycle` frames.
+    inputs: HashMap<String, InputLifecycle>,
+    /// Whether this CLI emits `command_lifecycle` at all. Older builds do not;
+    /// for them a `result` stays terminal on its own.
+    lifecycle_observed: bool,
 }
 
 fn capture_init_capabilities(value: &Value, capabilities: &mut HashSet<String>) {
@@ -1086,7 +1118,58 @@ impl TurnMessageBoundary {
         self.live_background_tasks.iter().cloned().collect()
     }
 
+    fn note_input(&mut self, input_id: &str) {
+        self.inputs
+            .entry(input_id.to_string())
+            .or_insert(InputLifecycle::Written);
+    }
+
+    fn observe_lifecycle(&mut self, value: &Value) {
+        if value.get("type").and_then(Value::as_str) != Some("command_lifecycle") {
+            return;
+        }
+        let (Some(command_uuid), Some(state)) = (
+            value.get("command_uuid").and_then(Value::as_str),
+            value.get("state").and_then(Value::as_str),
+        ) else {
+            return;
+        };
+        let Some(lifecycle) = self.inputs.get_mut(command_uuid) else {
+            return;
+        };
+        self.lifecycle_observed = true;
+        *lifecycle = match state {
+            "queued" => InputLifecycle::Queued,
+            "started" => InputLifecycle::Started,
+            "completed" | "failed" | "cancelled" | "error" => InputLifecycle::Final,
+            _ => return,
+        };
+    }
+
+    /// A steer written to stdin that missed the running command's tool
+    /// boundary is not merged into it: Claude Code queues it and runs it as a
+    /// fresh command after the current `result`, in the same process. That
+    /// follow-up still belongs to this Borg turn, so the `result` that
+    /// precedes it must not end the turn.
+    fn follow_up_pending(&self, result: &Value) -> bool {
+        if !self.lifecycle_observed {
+            return false;
+        }
+        let answered = result
+            .get("user_message_uuid")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        self.inputs.iter().any(|(input_id, lifecycle)| {
+            input_id != answered
+                && matches!(
+                    lifecycle,
+                    InputLifecycle::Written | InputLifecycle::Queued | InputLifecycle::Started
+                )
+        })
+    }
+
     fn classify(&mut self, value: &Value, input_ids: &HashSet<String>) -> TurnMessageAction {
+        self.observe_lifecycle(value);
         if value.get("type").and_then(Value::as_str) == Some("system")
             && value.get("subtype").and_then(Value::as_str) == Some("background_tasks_changed")
         {
@@ -1127,6 +1210,10 @@ impl TurnMessageBoundary {
         }
 
         self.awaiting_post_background_result = false;
+        if self.follow_up_pending(value) {
+            // The reply to a queued steer is still coming; keep reading.
+            return TurnMessageAction::Forward;
+        }
         TurnMessageAction::Terminal
     }
 }
@@ -1227,8 +1314,10 @@ pub async fn run(
     )
     .await?;
 
+    let mut turn_boundary = TurnMessageBoundary::default();
     let (initial_input_id, initial_message) =
         user_message_with_id(&prompt_text(&req.prompt, &req.attachments));
+    turn_boundary.note_input(&initial_input_id);
     let mut input_ids = HashSet::from([initial_input_id]);
     write_line(&mut stdin, &initial_message).await?;
 
@@ -1239,7 +1328,6 @@ pub async fn run(
     let mut capabilities = HashSet::new();
     let mut context_deadline = None;
     let mut interrupt_deadline = None;
-    let mut turn_boundary = TurnMessageBoundary::default();
 
     while !stream_ended || channel.has_pending_interrupt_cleanup() {
         line.clear();
@@ -1334,6 +1422,9 @@ pub async fn run(
                             &capabilities,
                         ).await? {
                             stream_ended = true;
+                        }
+                        for input_id in &input_ids {
+                            turn_boundary.note_input(input_id);
                         }
                         if channel.has_pending_interrupt_cleanup() {
                             interrupt_deadline = Some(
@@ -1524,10 +1615,13 @@ async fn run_pooled_native_turn(
         .await?;
         pooled.started = true;
     }
+    let mut turn_boundary = TurnMessageBoundary::default();
     let (input_id, message) = user_message_with_id(&prompt_text(&req.prompt, &req.attachments));
+    turn_boundary.note_input(&input_id);
     let mut input_ids = HashSet::from([input_id]);
     write_line(&mut pooled.stdin, &message).await?;
     for (input_id, message) in pooled.pending_steers.drain(..) {
+        turn_boundary.note_input(&input_id);
         input_ids.insert(input_id);
         write_line(&mut pooled.stdin, &message).await?;
     }
@@ -1538,7 +1632,6 @@ async fn run_pooled_native_turn(
     let mut abnormal_end = false;
     let mut context_deadline = None;
     let mut interrupt_deadline = None;
-    let mut turn_boundary = TurnMessageBoundary::default();
 
     while !terminal_seen
         || channel.has_pending_context_usage()
@@ -1644,6 +1737,9 @@ async fn run_pooled_native_turn(
                 ).await? {
                     terminal_seen = true;
                 }
+                for input_id in &input_ids {
+                    turn_boundary.note_input(input_id);
+                }
                 if channel.has_pending_interrupt_cleanup() {
                     interrupt_deadline = Some(
                         tokio::time::Instant::now() + std::time::Duration::from_secs(2),
@@ -1719,9 +1815,11 @@ fn queue_or_reject_native_control(pooled: &mut PooledClaudeNative, control: Chat
         ChatStreamControl::Steer {
             text,
             attachments,
+            message_id,
             ack,
         } => {
-            let (input_id, message) = user_message_with_id(&prompt_text(&text, &attachments));
+            let (input_id, message) =
+                user_message_with_explicit_id(&prompt_text(&text, &attachments), message_id);
             pooled.pending_steers.push((input_id, message));
             let _ = ack.send(Ok(()));
         }
@@ -1798,9 +1896,11 @@ async fn apply_control(
         ChatStreamControl::Steer {
             text,
             attachments,
+            message_id,
             ack,
         } => {
-            let (input_id, message) = user_message_with_id(&prompt_text(&text, &attachments));
+            let (input_id, message) =
+                user_message_with_explicit_id(&prompt_text(&text, &attachments), message_id);
             let result = write_line(stdin, &message).await;
             if result.is_ok() {
                 input_ids.insert(input_id);
@@ -1949,6 +2049,97 @@ mod tests {
             .interaction_reply("interaction-1", json!({"action": "accept", "content": {}}))
             .expect("interaction reply");
         assert_eq!(reply["response"]["request_id"], "interaction-wire");
+    }
+
+    fn lifecycle(command_uuid: &str, state: &str) -> Value {
+        json!({"type": "command_lifecycle", "command_uuid": command_uuid, "state": state})
+    }
+
+    fn result_for(user_message_uuid: &str) -> Value {
+        json!({"type": "result", "subtype": "success", "result": "ok", "user_message_uuid": user_message_uuid})
+    }
+
+    #[test]
+    fn steer_queued_past_the_result_keeps_the_turn_open_until_its_own_result() {
+        // Scenario observed against claude 2.1.258: a steer written before any
+        // tool boundary is run as a follow-up command after the first result.
+        let mut boundary = TurnMessageBoundary::default();
+        boundary.note_input("prompt");
+        boundary.note_input("steer");
+        let inputs = HashSet::from(["prompt".to_string(), "steer".to_string()]);
+        for frame in [
+            lifecycle("prompt", "queued"),
+            lifecycle("prompt", "started"),
+            lifecycle("steer", "queued"),
+        ] {
+            assert_eq!(
+                boundary.classify(&frame, &inputs),
+                TurnMessageAction::Forward
+            );
+        }
+        assert_eq!(
+            boundary.classify(&result_for("prompt"), &inputs),
+            TurnMessageAction::Forward,
+            "the steer is still queued, so the first result is not terminal"
+        );
+        for frame in [
+            lifecycle("prompt", "completed"),
+            lifecycle("steer", "started"),
+        ] {
+            assert_eq!(
+                boundary.classify(&frame, &inputs),
+                TurnMessageAction::Forward
+            );
+        }
+        assert_eq!(
+            boundary.classify(&result_for("steer"), &inputs),
+            TurnMessageAction::Terminal
+        );
+    }
+
+    #[test]
+    fn steer_folded_at_a_tool_boundary_ends_with_the_original_result() {
+        let mut boundary = TurnMessageBoundary::default();
+        boundary.note_input("prompt");
+        boundary.note_input("steer");
+        let inputs = HashSet::from(["prompt".to_string(), "steer".to_string()]);
+        for frame in [
+            lifecycle("prompt", "queued"),
+            lifecycle("prompt", "started"),
+            lifecycle("steer", "queued"),
+            lifecycle("steer", "started"),
+            lifecycle("steer", "completed"),
+        ] {
+            assert_eq!(
+                boundary.classify(&frame, &inputs),
+                TurnMessageAction::Forward
+            );
+        }
+        assert_eq!(
+            boundary.classify(&result_for("prompt"), &inputs),
+            TurnMessageAction::Terminal
+        );
+    }
+
+    #[test]
+    fn cli_without_command_lifecycle_still_ends_on_the_result() {
+        let mut boundary = TurnMessageBoundary::default();
+        boundary.note_input("prompt");
+        boundary.note_input("steer");
+        let inputs = HashSet::from(["prompt".to_string(), "steer".to_string()]);
+        assert_eq!(
+            boundary.classify(&result_for("prompt"), &inputs),
+            TurnMessageAction::Terminal
+        );
+    }
+
+    #[test]
+    fn explicit_steer_ids_are_stamped_on_the_stdin_message() {
+        let (id, message) = user_message_with_explicit_id("hi", Some("borg-msg-1".into()));
+        assert_eq!(id, "borg-msg-1");
+        assert_eq!(message["uuid"], "borg-msg-1");
+        let (minted, _) = user_message_with_explicit_id("hi", Some("  ".into()));
+        assert!(uuid::Uuid::parse_str(&minted).is_ok());
     }
 
     #[test]
