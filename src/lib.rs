@@ -524,6 +524,69 @@ fn truncate(text: &str, max: usize) -> &str {
 }
 
 // ---------------------------------------------------------------------------
+// Line reads
+// ---------------------------------------------------------------------------
+
+/// A cancellation-safe line reader over the child's stdout.
+///
+/// `AsyncBufReadExt::read_line` is **not** cancellation safe. When it loses a
+/// `tokio::select!` race — or a `timeout_at` fires — the future is dropped and
+/// the bytes it already consumed from the underlying buffer are gone. The next
+/// read then resumes in the middle of the frame, so a long line such as the
+/// CLI's MCP tool inventory arrives as `serverName":"borg_agent",...` and
+/// fails to parse with `expected value at line 1 column 1`.
+///
+/// `fill_buf` *is* cancellation safe: it never consumes on cancellation. We
+/// assemble the line ourselves and only consume what has been copied into
+/// `partial`, so a dropped future leaves the prefix buffered and the next call
+/// resumes exactly where it stopped.
+struct LineReader<R> {
+    reader: R,
+    partial: Vec<u8>,
+}
+
+impl<R: tokio::io::AsyncBufRead + Unpin> LineReader<R> {
+    fn new(reader: R) -> Self {
+        Self {
+            reader,
+            partial: Vec::new(),
+        }
+    }
+
+    /// The next line with its trailing newline removed, or `None` at EOF.
+    ///
+    /// Cancellation safe. A trailing fragment without a newline is returned
+    /// once at EOF so a final unterminated frame is not silently dropped.
+    async fn next_line(&mut self) -> std::io::Result<Option<String>> {
+        loop {
+            let available = self.reader.fill_buf().await?;
+            if available.is_empty() {
+                if self.partial.is_empty() {
+                    return Ok(None);
+                }
+                return self.take_partial().map(Some);
+            }
+            let (copy, consume, complete) = match available.iter().position(|byte| *byte == b'\n') {
+                Some(index) => (index, index + 1, true),
+                None => (available.len(), available.len(), false),
+            };
+            self.partial.extend_from_slice(&available[..copy]);
+            self.reader.consume(consume);
+            if complete {
+                return self.take_partial().map(Some);
+            }
+        }
+    }
+
+    fn take_partial(&mut self) -> std::io::Result<String> {
+        let line = std::mem::take(&mut self.partial);
+        String::from_utf8(line).map_err(|error| {
+            std::io::Error::new(std::io::ErrorKind::InvalidData, error.utf8_error())
+        })
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Frames
 // ---------------------------------------------------------------------------
 
@@ -1434,8 +1497,7 @@ pub async fn run(
     let mut input_ids = HashSet::from([initial_input_id]);
     write_line(&mut stdin, &initial_message).await?;
 
-    let mut reader = tokio::io::BufReader::new(stdout);
-    let mut line = String::new();
+    let mut reader = LineReader::new(tokio::io::BufReader::new(stdout));
     let mut stream_ended = false;
     let mut terminal_seen = false;
     let mut capabilities = HashSet::new();
@@ -1443,7 +1505,6 @@ pub async fn run(
     let mut interrupt_deadline = None;
 
     while !stream_ended || channel.has_pending_interrupt_cleanup() {
-        line.clear();
         let context_deadline_at = context_deadline;
         tokio::select! {
             biased;
@@ -1460,11 +1521,10 @@ pub async fn run(
                 channel.fail_interrupt_cleanup();
                 stream_ended = true;
             }
-            read = reader.read_line(&mut line) => {
-                let read = read.context("failed reading claude stdout")?;
-                if read == 0 {
+            read = reader.next_line() => {
+                let Some(line) = read.context("failed reading claude stdout")? else {
                     break;
-                }
+                };
                 let trimmed = line.trim_end_matches(['\r', '\n']);
                 if trimmed.is_empty() {
                     continue;
@@ -1603,7 +1663,7 @@ pub async fn run(
 struct PooledClaudeNative {
     child: tokio::process::Child,
     stdin: tokio::process::ChildStdin,
-    stdout: tokio::io::BufReader<tokio::process::ChildStdout>,
+    stdout: LineReader<tokio::io::BufReader<tokio::process::ChildStdout>>,
     stderr: std::sync::Arc<tokio::sync::Mutex<String>>,
     _runtime_directory: Option<RuntimeDirectory>,
     lifecycle_key: String,
@@ -1689,12 +1749,12 @@ async fn start_pooled_native(req: &ChatStreamRequest) -> Result<PooledClaudeNati
         .stdin
         .take()
         .ok_or_else(|| anyhow!("pooled claude stdin pipe missing"))?;
-    let stdout = tokio::io::BufReader::new(
+    let stdout = LineReader::new(tokio::io::BufReader::new(
         child
             .stdout
             .take()
             .ok_or_else(|| anyhow!("pooled claude stdout pipe missing"))?,
-    );
+    ));
     let stderr = std::sync::Arc::new(tokio::sync::Mutex::new(String::new()));
     let child_stderr = child
         .stderr
@@ -1851,16 +1911,14 @@ async fn apply_in_place_switch(
         expected += 1;
     }
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
-    let mut line = String::new();
     while expected > 0 {
-        line.clear();
-        let read = tokio::time::timeout_at(deadline, pooled.stdout.read_line(&mut line))
+        let line = tokio::time::timeout_at(deadline, pooled.stdout.next_line())
             .await
             .context("timed out waiting for the Claude model switch response")?
             .context("failed reading pooled claude stdout")?;
-        if read == 0 {
+        let Some(line) = line else {
             bail!("pooled claude exited during a model switch");
-        }
+        };
         let trimmed = line.trim_end_matches(['\r', '\n']);
         if trimmed.is_empty() {
             continue;
@@ -1937,15 +1995,14 @@ async fn run_pooled_native_turn(
                 channel.fail_interrupt_cleanup();
                 break;
             }
-            read = pooled.stdout.read_line(&mut line) => {
-                let read = read.context("failed reading pooled claude stdout")?;
-                if read == 0 {
+            read = pooled.stdout.next_line() => {
+                let Some(line) = read.context("failed reading pooled claude stdout")? else {
                     let stderr = pooled.stderr.lock().await.clone();
                     if terminal_seen {
                         break;
                     }
                     bail!("pooled claude exited unexpectedly: {}", stderr.trim());
-                }
+                };
                 let trimmed = line.trim_end_matches(['\r', '\n']);
                 if trimmed.is_empty() {
                     continue;
@@ -2282,6 +2339,73 @@ mod tests {
                 if request_id == "r1" && value["ok"] == true
         ));
         assert!(Frame::parse("not json").is_err());
+    }
+
+    /// A long frame that loses a `select!` race must not be torn in half.
+    ///
+    /// This is the regression for `failed to parse claude frame:
+    /// serverName":"borg_agent",... expected value at line 1 column 1` — the
+    /// tail of an MCP tool-inventory frame arriving as if it were a whole line
+    /// because `read_line` dropped the prefix it had already consumed.
+    #[tokio::test]
+    async fn line_reader_keeps_partial_frames_across_cancelled_reads() {
+        use tokio::io::AsyncWriteExt;
+
+        let (mut writer, reader) = tokio::io::duplex(4096);
+        let mut lines = LineReader::new(tokio::io::BufReader::new(reader));
+
+        let head = r#"{"type":"system","tools":[{"name":"mcp__borg_agent__lsp_hover","#;
+        let tail = r#""serverName":"borg_agent","tokens":276,"isLoaded":false}]}"#;
+        writer.write_all(head.as_bytes()).await.unwrap();
+
+        // Poll the read first so it consumes the prefix, then let the timer win
+        // and drop the future — exactly what the stdout loop's deadline
+        // branches do to an in-flight read.
+        for _ in 0..3 {
+            tokio::select! {
+                biased;
+                _ = lines.next_line() => panic!("line completed before its newline"),
+                () = tokio::time::sleep(std::time::Duration::from_millis(1)) => {}
+            }
+        }
+
+        writer
+            .write_all(format!("{tail}\n").as_bytes())
+            .await
+            .unwrap();
+
+        let line = lines.next_line().await.unwrap().expect("line");
+        assert_eq!(line, format!("{head}{tail}"));
+        Frame::parse(&line).expect("reassembled frame parses");
+    }
+
+    #[tokio::test]
+    async fn line_reader_splits_batched_lines_and_flushes_eof_remainder() {
+        use tokio::io::AsyncWriteExt;
+
+        let (mut writer, reader) = tokio::io::duplex(4096);
+        let mut lines = LineReader::new(tokio::io::BufReader::new(reader));
+
+        writer
+            .write_all(b"{\"type\":\"keep_alive\"}\n{\"type\":\"user\"}\nunterminated")
+            .await
+            .unwrap();
+        drop(writer);
+
+        assert_eq!(
+            lines.next_line().await.unwrap().as_deref(),
+            Some(r#"{"type":"keep_alive"}"#)
+        );
+        assert_eq!(
+            lines.next_line().await.unwrap().as_deref(),
+            Some(r#"{"type":"user"}"#)
+        );
+        // A trailing fragment is surfaced once rather than silently dropped.
+        assert_eq!(
+            lines.next_line().await.unwrap().as_deref(),
+            Some("unterminated")
+        );
+        assert_eq!(lines.next_line().await.unwrap(), None);
     }
 
     #[test]
