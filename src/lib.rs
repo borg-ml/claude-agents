@@ -1443,11 +1443,12 @@ pub async fn run(
     let _runtime_directory = req.runtime_directory.clone();
     let started_at = std::time::Instant::now();
     let program = req.command.program.clone();
-    let mut child = req
-        .command
-        .into_command()
-        .spawn()
-        .with_context(|| format!("failed to spawn {}", program.display()))?;
+    let mut child = ClaudeChild(
+        req.command
+            .into_command()
+            .spawn()
+            .with_context(|| format!("failed to spawn {}", program.display()))?,
+    );
     let mut stdin = child
         .stdin
         .take()
@@ -1661,8 +1662,82 @@ pub async fn run(
     Ok(())
 }
 
+/// A running Claude Code process.
+///
+/// Claude Code starts each Bash tool command in a session of its own, so
+/// killing Claude, or even its process group, leaves those commands running
+/// unattended. Stopping this process kills every child's process group first.
+/// Dropping it while Claude still runs stops it the same way.
+struct ClaudeChild(tokio::process::Child);
+
+impl std::ops::Deref for ClaudeChild {
+    type Target = tokio::process::Child;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl std::ops::DerefMut for ClaudeChild {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
+    }
+}
+
+impl ClaudeChild {
+    async fn terminate(&mut self) {
+        self.kill_tool_commands();
+        let _ = self.0.kill().await;
+    }
+
+    fn kill_tool_commands(&mut self) {
+        #[cfg(target_os = "linux")]
+        if matches!(self.0.try_wait(), Ok(None))
+            && let Some(pid) = self.0.id()
+        {
+            use nix::sys::signal::{Signal, killpg};
+            use nix::unistd::{Pid, getpgid};
+
+            let claude = Pid::from_raw(pid as i32);
+            for child in linux_child_pids(pid) {
+                if let Ok(group) = getpgid(Some(Pid::from_raw(child)))
+                    && group != claude
+                {
+                    let _ = killpg(group, Signal::SIGKILL);
+                }
+            }
+            // Spawned with `process_group(0)`: Claude leads its own group,
+            // which also holds its MCP helpers.
+            let _ = killpg(claude, Signal::SIGKILL);
+        }
+    }
+}
+
+impl Drop for ClaudeChild {
+    fn drop(&mut self) {
+        self.kill_tool_commands();
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn linux_child_pids(pid: u32) -> Vec<i32> {
+    let Ok(tasks) = std::fs::read_dir(format!("/proc/{pid}/task")) else {
+        return Vec::new();
+    };
+    tasks
+        .flatten()
+        .filter_map(|task| std::fs::read_to_string(task.path().join("children")).ok())
+        .flat_map(|children| {
+            children
+                .split_whitespace()
+                .filter_map(|child| child.parse().ok())
+                .collect::<Vec<i32>>()
+        })
+        .collect()
+}
+
 struct PooledClaudeNative {
-    child: tokio::process::Child,
+    child: ClaudeChild,
     stdin: tokio::process::ChildStdin,
     stdout: LineReader<tokio::io::BufReader<tokio::process::ChildStdout>>,
     stderr: std::sync::Arc<tokio::sync::Mutex<String>>,
@@ -1740,12 +1815,13 @@ pub(crate) fn in_place_switch(current: &CommandSpec, next: &CommandSpec) -> Opti
 
 async fn start_pooled_native(req: &ChatStreamRequest) -> Result<PooledClaudeNative> {
     let program = req.command.program.clone();
-    let mut child = req
-        .command
-        .clone()
-        .into_command()
-        .spawn()
-        .with_context(|| format!("failed to spawn {}", program.display()))?;
+    let mut child = ClaudeChild(
+        req.command
+            .clone()
+            .into_command()
+            .spawn()
+            .with_context(|| format!("failed to spawn {}", program.display()))?,
+    );
     let stdin = child
         .stdin
         .take()
@@ -1809,7 +1885,7 @@ pub async fn run_pooled(
                         tracing::warn!(%error, "in-place Claude model switch failed; respawning");
                         let mut pending_steers = Vec::new();
                         transfer_pending_steers(&mut pooled.pending_steers, &mut pending_steers);
-                        let _ = pooled.child.kill().await;
+                        let _ = pooled.child.terminate().await;
                         let mut fresh = start_pooled_native(&req).await?;
                         fresh.pending_steers = pending_steers;
                         fresh
@@ -1820,7 +1896,7 @@ pub async fn run_pooled(
                     // MCP config, environment): only a fresh process honours it.
                     let mut pending_steers = Vec::new();
                     transfer_pending_steers(&mut pooled.pending_steers, &mut pending_steers);
-                    let _ = pooled.child.kill().await;
+                    let _ = pooled.child.terminate().await;
                     let mut fresh = start_pooled_native(&req).await?;
                     fresh.pending_steers = pending_steers;
                     fresh
@@ -1830,7 +1906,7 @@ pub async fn run_pooled(
         Some(mut stale) => {
             let mut pending_steers = Vec::new();
             transfer_pending_steers(&mut stale.pending_steers, &mut pending_steers);
-            let _ = stale.child.kill().await;
+            let _ = stale.child.terminate().await;
             let mut fresh = start_pooled_native(&req).await?;
             fresh.pending_steers = pending_steers;
             fresh
@@ -1849,14 +1925,14 @@ pub async fn run_pooled(
     let reusable = match terminal {
         Ok(reusable) => reusable,
         Err(error) => {
-            let _ = pooled.child.kill().await;
+            let _ = pooled.child.terminate().await;
             return Err(error);
         }
     };
     if reusable {
         *guard = Some(pooled);
     } else {
-        let _ = pooled.child.kill().await;
+        let _ = pooled.child.terminate().await;
     }
     Ok(())
 }
