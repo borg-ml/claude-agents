@@ -9,6 +9,7 @@ use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, anyhow, bail};
+use base64::Engine as _;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
@@ -228,16 +229,67 @@ fn isolate_async_process_from_terminal(command: &mut tokio::process::Command) {
 #[cfg(not(unix))]
 fn isolate_async_process_from_terminal(_command: &mut tokio::process::Command) {}
 
-fn prompt_text(prompt: &str, attachments: &[PathBuf]) -> String {
+/// Claude Code downsizes inline images itself; this cap only keeps
+/// pathological files out of the stdin stream.
+const MAX_INLINE_IMAGE_BYTES: u64 = 20 * 1024 * 1024;
+
+/// User content blocks: the prompt with every attachment path listed, followed
+/// by the image attachments inline so the model sees them without a tool call.
+fn prompt_content(prompt: &str, attachments: &[PathBuf]) -> Value {
     if attachments.is_empty() {
-        return prompt.to_string();
+        return serde_json::json!([{"type": "text", "text": prompt}]);
     }
+    let mut images = Vec::new();
     let list = attachments
         .iter()
-        .map(|path| format!("- {}", path.display()))
+        .map(|path| match inline_image(path) {
+            Some(image) => {
+                images.push(image);
+                format!("- {} (image included below)", path.display())
+            }
+            None => format!("- {}", path.display()),
+        })
         .collect::<Vec<_>>()
         .join("\n");
-    format!("{prompt}\n\nAttached files:\n{list}")
+    let mut content = vec![serde_json::json!({
+        "type": "text",
+        "text": format!("{prompt}\n\nAttached files:\n{list}"),
+    })];
+    content.extend(images);
+    Value::Array(content)
+}
+
+fn inline_image(path: &Path) -> Option<Value> {
+    let extension = path.extension()?.to_str()?.to_ascii_lowercase();
+    if !matches!(extension.as_str(), "png" | "jpg" | "jpeg" | "gif" | "webp") {
+        return None;
+    }
+    let metadata = std::fs::metadata(path).ok()?;
+    if !metadata.is_file() || metadata.len() > MAX_INLINE_IMAGE_BYTES {
+        return None;
+    }
+    let bytes = std::fs::read(path).ok()?;
+    // The API rejects a media type that disagrees with the bytes, so trust the
+    // signature rather than the extension.
+    let media_type = if bytes.starts_with(b"\x89PNG") {
+        "image/png"
+    } else if bytes.starts_with(&[0xFF, 0xD8, 0xFF]) {
+        "image/jpeg"
+    } else if bytes.starts_with(b"GIF8") {
+        "image/gif"
+    } else if bytes.starts_with(b"RIFF") && bytes.get(8..12) == Some(b"WEBP") {
+        "image/webp"
+    } else {
+        return None;
+    };
+    Some(serde_json::json!({
+        "type": "image",
+        "source": {
+            "type": "base64",
+            "media_type": media_type,
+            "data": base64::engine::general_purpose::STANDARD.encode(bytes),
+        },
+    }))
 }
 
 #[derive(Debug, Clone, Default)]
@@ -1122,20 +1174,20 @@ fn normalize_elicitation_payload(request: &Value) -> Value {
 
 /// Build a user message envelope for the Claude Code stream.
 pub fn user_message(text: &str) -> Value {
-    user_message_with_id(text).1
+    user_message_with_id(prompt_content(text, &[])).1
 }
 
-fn user_message_with_id(text: &str) -> (String, Value) {
-    user_message_with_explicit_id(text, None)
+fn user_message_with_id(content: Value) -> (String, Value) {
+    user_message_with_explicit_id(content, None)
 }
 
-fn user_message_with_explicit_id(text: &str, id: Option<String>) -> (String, Value) {
+fn user_message_with_explicit_id(content: Value, id: Option<String>) -> (String, Value) {
     let id = id
         .filter(|id| !id.trim().is_empty())
         .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
     let message = serde_json::json!({
         "type": "user",
-        "message": {"role": "user", "content": [{"type": "text", "text": text}]},
+        "message": {"role": "user", "content": content},
         "parent_tool_use_id": Value::Null,
         "session_id": "",
         "uuid": id,
@@ -1493,7 +1545,7 @@ pub async fn run(
 
     let mut turn_boundary = TurnMessageBoundary::default();
     let (initial_input_id, initial_message) =
-        user_message_with_id(&prompt_text(&req.prompt, &req.attachments));
+        user_message_with_id(prompt_content(&req.prompt, &req.attachments));
     turn_boundary.note_input(&initial_input_id);
     let mut input_ids = HashSet::from([initial_input_id]);
     write_line(&mut stdin, &initial_message).await?;
@@ -2049,7 +2101,7 @@ async fn run_pooled_native_turn(
         pooled.started = true;
     }
     let mut turn_boundary = TurnMessageBoundary::default();
-    let (input_id, message) = user_message_with_id(&prompt_text(&req.prompt, &req.attachments));
+    let (input_id, message) = user_message_with_id(prompt_content(&req.prompt, &req.attachments));
     turn_boundary.note_input(&input_id);
     let mut input_ids = HashSet::from([input_id]);
     write_line(&mut pooled.stdin, &message).await?;
@@ -2254,7 +2306,7 @@ fn queue_or_reject_native_control(pooled: &mut PooledClaudeNative, control: Chat
             ack,
         } => {
             let (input_id, message) =
-                user_message_with_explicit_id(&prompt_text(&text, &attachments), message_id);
+                user_message_with_explicit_id(prompt_content(&text, &attachments), message_id);
             pooled.pending_steers.push((input_id, message));
             let _ = ack.send(Ok(()));
         }
@@ -2337,7 +2389,7 @@ async fn apply_control(
             ack,
         } => {
             let (input_id, mut message) =
-                user_message_with_explicit_id(&prompt_text(&text, &attachments), message_id);
+                user_message_with_explicit_id(prompt_content(&text, &attachments), message_id);
             if preempt {
                 stamp_priority_now(&mut message);
             }
@@ -2880,7 +2932,7 @@ mod tests {
 
     #[test]
     fn preempting_steers_are_stamped_priority_now() {
-        let (_, mut message) = user_message_with_explicit_id("hi", None);
+        let (_, mut message) = user_message_with_explicit_id(prompt_content("hi", &[]), None);
         assert!(message.get("priority").is_none());
         stamp_priority_now(&mut message);
         assert_eq!(message["priority"], "now");
@@ -2888,11 +2940,33 @@ mod tests {
     }
 
     #[test]
+    fn image_attachments_are_sent_inline_and_other_files_by_path() {
+        let dir = tempfile::tempdir().unwrap();
+        // A JPEG signature behind a .png name: the media type must follow the bytes.
+        let image = dir.path().join("shot.png");
+        std::fs::write(&image, [0xFF, 0xD8, 0xFF, 0xE0]).unwrap();
+        let notes = dir.path().join("notes.txt");
+        std::fs::write(&notes, "text").unwrap();
+
+        let content = prompt_content("look", &[image.clone(), notes.clone()]);
+        let blocks = content.as_array().unwrap();
+        assert_eq!(blocks.len(), 2);
+        let text = blocks[0]["text"].as_str().unwrap();
+        assert!(text.contains(&image.display().to_string()));
+        assert!(text.contains(&notes.display().to_string()));
+        assert_eq!(blocks[1]["type"], "image");
+        assert_eq!(blocks[1]["source"]["media_type"], "image/jpeg");
+        assert_eq!(blocks[1]["source"]["data"], "/9j/4A==");
+    }
+
+    #[test]
     fn explicit_steer_ids_are_stamped_on_the_stdin_message() {
-        let (id, message) = user_message_with_explicit_id("hi", Some("borg-msg-1".into()));
+        let (id, message) =
+            user_message_with_explicit_id(prompt_content("hi", &[]), Some("borg-msg-1".into()));
         assert_eq!(id, "borg-msg-1");
         assert_eq!(message["uuid"], "borg-msg-1");
-        let (minted, _) = user_message_with_explicit_id("hi", Some("  ".into()));
+        let (minted, _) =
+            user_message_with_explicit_id(prompt_content("hi", &[]), Some("  ".into()));
         assert!(uuid::Uuid::parse_str(&minted).is_ok());
     }
 
