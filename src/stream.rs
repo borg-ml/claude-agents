@@ -27,6 +27,9 @@ impl ClaudeStreamState {
         value: &Value,
         tx: &mpsc::Sender<ChatStreamEvent>,
     ) -> Result<bool> {
+        if is_subagent_message(value) {
+            return Ok(false);
+        }
         let message_type = value.get("type").and_then(Value::as_str).unwrap_or("");
         match message_type {
             "stream_event" => {
@@ -379,6 +382,16 @@ impl ClaudeStreamState {
     }
 }
 
+/// Claude Code runs Agent-tool subagents in-process and reports their messages
+/// on the same stream, tagged with the Agent call that owns them. They are the
+/// subagent's own transcript, not this turn's text or tool calls; callers still
+/// receive them as raw provider events.
+pub(crate) fn is_subagent_message(value: &Value) -> bool {
+    value
+        .get("parent_tool_use_id")
+        .is_some_and(|id| !id.is_null())
+}
+
 #[cfg(test)]
 mod tests {
     use crate::ChatStreamEvent as StreamEvent;
@@ -413,6 +426,45 @@ mod tests {
             rx.try_recv(),
             Ok(StreamEvent::ReasoningDelta(text)) if text == "checking the source"
         ));
+    }
+
+    #[tokio::test]
+    async fn subagent_messages_are_not_the_parent_turn() {
+        let (tx, mut rx) = stream_channel::channel(8);
+        let mut state = StreamState::default();
+        for message in [
+            json_value!({
+                "type": "assistant",
+                "parent_tool_use_id": "toolu_agent",
+                "message": {"content": [
+                    {"type": "text", "text": "subagent narration"},
+                    {"type": "tool_use", "id": "toolu_child", "name": "Bash", "input": {}}
+                ]}
+            }),
+            json_value!({
+                "type": "user",
+                "parent_tool_use_id": "toolu_agent",
+                "message": {"content": [
+                    {"type": "tool_result", "tool_use_id": "toolu_child", "content": "done"}
+                ]}
+            }),
+        ] {
+            assert!(!state.handle_message(&message, &tx).await.unwrap());
+        }
+        assert!(rx.try_recv().is_err());
+
+        state
+            .handle_message(
+                &json_value!({
+                    "type": "assistant",
+                    "parent_tool_use_id": null,
+                    "message": {"content": [{"type": "text", "text": "parent"}]}
+                }),
+                &tx,
+            )
+            .await
+            .unwrap();
+        assert!(matches!(rx.try_recv(), Ok(StreamEvent::Delta(text)) if text == "parent"));
     }
 
     #[tokio::test]

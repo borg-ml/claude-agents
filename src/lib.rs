@@ -1541,6 +1541,7 @@ pub async fn run(
                         let state_ended = state.handle_message(&value, &tx).await?;
                         if value.get("type").and_then(Value::as_str) == Some("assistant")
                             && !state_ended
+                            && !stream::is_subagent_message(&value)
                         {
                             if let Err(error) =
                                 request_context_usage(&mut channel, &mut stdin).await
@@ -2019,6 +2020,7 @@ async fn run_pooled_native_turn(
                         let state_ended = state.handle_message(&value, tx).await?;
                         if value.get("type").and_then(Value::as_str) == Some("assistant")
                             && !state_ended
+                            && !stream::is_subagent_message(&value)
                         {
                             if let Err(error) =
                                 request_context_usage(&mut channel, &mut pooled.stdin).await
