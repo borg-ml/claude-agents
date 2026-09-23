@@ -1695,16 +1695,21 @@ impl ClaudeChild {
         if matches!(self.0.try_wait(), Ok(None))
             && let Some(pid) = self.0.id()
         {
-            use nix::sys::signal::{Signal, killpg};
+            use nix::sys::signal::{Signal, kill, killpg};
             use nix::unistd::{Pid, getpgid};
 
+            // Collect the whole tree first: killing a parent reparents its
+            // children and hides them. Claude's Bash tool shell uses job
+            // control, so each command runs in a group of its own.
             let claude = Pid::from_raw(pid as i32);
-            for child in linux_child_pids(pid) {
-                if let Ok(group) = getpgid(Some(Pid::from_raw(child)))
+            for descendant in linux_descendants(pid) {
+                let descendant = Pid::from_raw(descendant);
+                if let Ok(group) = getpgid(Some(descendant))
                     && group != claude
                 {
                     let _ = killpg(group, Signal::SIGKILL);
                 }
+                let _ = kill(descendant, Signal::SIGKILL);
             }
             // Spawned with `process_group(0)`: Claude leads its own group,
             // which also holds its MCP helpers.
@@ -1719,21 +1724,31 @@ impl Drop for ClaudeChild {
     }
 }
 
+/// Every process below `pid`, parents before their children.
 #[cfg(target_os = "linux")]
-fn linux_child_pids(pid: u32) -> Vec<i32> {
-    let Ok(tasks) = std::fs::read_dir(format!("/proc/{pid}/task")) else {
-        return Vec::new();
-    };
-    tasks
-        .flatten()
-        .filter_map(|task| std::fs::read_to_string(task.path().join("children")).ok())
-        .flat_map(|children| {
-            children
+fn linux_descendants(pid: u32) -> Vec<i32> {
+    let mut found = Vec::new();
+    let mut pending = vec![pid as i32];
+    while let Some(parent) = pending.pop() {
+        let Ok(tasks) = std::fs::read_dir(format!("/proc/{parent}/task")) else {
+            continue;
+        };
+        for children in tasks
+            .flatten()
+            .filter_map(|task| std::fs::read_to_string(task.path().join("children")).ok())
+        {
+            for child in children
                 .split_whitespace()
                 .filter_map(|child| child.parse().ok())
-                .collect::<Vec<i32>>()
-        })
-        .collect()
+            {
+                if !found.contains(&child) && found.len() < 4096 {
+                    found.push(child);
+                    pending.push(child);
+                }
+            }
+        }
+    }
+    found
 }
 
 struct PooledClaudeNative {
@@ -2398,6 +2413,41 @@ async fn write_line(stdin: &mut tokio::process::ChildStdin, value: &Value) -> Re
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn dropping_a_running_claude_stops_its_tool_commands() {
+        let dir = tempfile::tempdir().unwrap();
+        let pid_file = dir.path().join("tool.pid");
+        // Claude Code runs each Bash tool command in a session of its own.
+        // Claude Code runs each Bash tool command in a session of its own, and
+        // that shell puts each command in yet another process group.
+        let script = format!(
+            "setsid sh -c 'setsid sleep 30 & echo $! > {}; wait' & exec sleep 60",
+            pid_file.display()
+        );
+        let mut command = tokio::process::Command::new("sh");
+        command.args(["-c", &script]).kill_on_drop(true);
+        isolate_async_process_from_terminal(&mut command);
+        let child = ClaudeChild(command.spawn().unwrap());
+        let tool = loop {
+            if let Some(pid) = std::fs::read_to_string(&pid_file)
+                .ok()
+                .and_then(|pid| pid.trim().parse::<i32>().ok())
+            {
+                break nix::unistd::Pid::from_raw(pid);
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        };
+        drop(child);
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        assert!(
+            nix::sys::signal::kill(tool, None).is_err()
+                || std::fs::read_to_string(format!("/proc/{tool}/stat"))
+                    .is_ok_and(|stat| stat.contains(") Z ")),
+            "the tool command outlived Claude"
+        );
+    }
     use serde_json::json;
     use std::path::Path;
 
