@@ -19,6 +19,11 @@ pub(crate) struct ClaudeStreamState {
     /// message. Forwarded back to the caller on `Done` so the next
     /// turn can `resume: session_id`.
     pub(crate) session_id: Option<String>,
+    /// Tokens of in-process subagent API calls, which the turn's `result`
+    /// usage leaves out. Claude Code repeats a call's usage on every content
+    /// block envelope, so each message id is counted once.
+    subagent_usage: ProviderCallUsage,
+    subagent_message_ids: std::collections::HashSet<String>,
 }
 
 impl ClaudeStreamState {
@@ -28,6 +33,18 @@ impl ClaudeStreamState {
         tx: &mpsc::Sender<ChatStreamEvent>,
     ) -> Result<bool> {
         if is_subagent_message(value) {
+            if value.get("type").and_then(Value::as_str) == Some("assistant")
+                && let Some(id) = value.pointer("/message/id").and_then(Value::as_str)
+                && self.subagent_message_ids.insert(id.to_string())
+            {
+                let usage = extract_claude_usage(value);
+                let total = &mut self.subagent_usage;
+                total.input_tokens += usage.input_tokens;
+                total.cached_input_tokens += usage.cached_input_tokens;
+                total.cache_creation_input_tokens += usage.cache_creation_input_tokens;
+                total.output_tokens += usage.output_tokens;
+                total.total_tokens += usage.total_tokens;
+            }
             return Ok(false);
         }
         let message_type = value.get("type").and_then(Value::as_str).unwrap_or("");
@@ -269,7 +286,14 @@ impl ClaudeStreamState {
                 }
             }
             "result" => {
-                let usage = extract_claude_usage(value);
+                let mut usage = extract_claude_usage(value);
+                // `total_cost_usd` already includes subagents; their tokens do not.
+                let subagents = std::mem::take(&mut self.subagent_usage);
+                usage.input_tokens += subagents.input_tokens;
+                usage.cached_input_tokens += subagents.cached_input_tokens;
+                usage.cache_creation_input_tokens += subagents.cache_creation_input_tokens;
+                usage.output_tokens += subagents.output_tokens;
+                usage.total_tokens += subagents.total_tokens;
                 if usage.duration_ms > 0 || usage.total_tokens > 0 || usage.cost_microusd.is_some()
                 {
                     self.final_usage = Some(usage);
@@ -465,6 +489,52 @@ mod tests {
             .await
             .unwrap();
         assert!(matches!(rx.try_recv(), Ok(StreamEvent::Delta(text)) if text == "parent"));
+    }
+
+    #[tokio::test]
+    async fn subagent_tokens_join_the_turn_usage_once_per_api_call() {
+        let (tx, _rx) = stream_channel::channel(8);
+        let mut state = StreamState::default();
+        let child_block = |block: serde_json::Value| {
+            json_value!({
+                "type": "assistant",
+                "parent_tool_use_id": "toolu_agent",
+                "message": {
+                    "id": "msg_child",
+                    "content": [block],
+                    "usage": {"input_tokens": 3, "cache_read_input_tokens": 100, "output_tokens": 20}
+                }
+            })
+        };
+        // One API call reported on two content-block envelopes.
+        for block in [
+            json_value!({"type": "text", "text": "looking"}),
+            json_value!({"type": "tool_use", "id": "toolu_child", "name": "Bash", "input": {}}),
+        ] {
+            state
+                .handle_message(&child_block(block), &tx)
+                .await
+                .unwrap();
+        }
+        state
+            .handle_message(
+                &json_value!({
+                    "type": "result",
+                    "subtype": "success",
+                    "result": "done",
+                    "total_cost_usd": 0.5,
+                    "usage": {"input_tokens": 4, "cache_read_input_tokens": 1000, "output_tokens": 50}
+                }),
+                &tx,
+            )
+            .await
+            .unwrap();
+        let usage = state.final_usage.expect("turn usage");
+        assert_eq!(usage.input_tokens, 7);
+        assert_eq!(usage.cached_input_tokens, 1100);
+        assert_eq!(usage.output_tokens, 70);
+        assert_eq!(usage.total_tokens, 1177);
+        assert_eq!(usage.cost_microusd, Some(500_000));
     }
 
     #[tokio::test]
