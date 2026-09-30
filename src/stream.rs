@@ -303,7 +303,7 @@ impl ClaudeStreamState {
                     .and_then(Value::as_str)
                     .unwrap_or("success")
                 {
-                    "success" => {
+                    "success" if value.get("is_error").and_then(Value::as_bool) != Some(true) => {
                         // When the caller passed `outputFormat: { type: "json_schema", ... }`,
                         // the Agent SDK validates the final assistant output against the
                         // schema and emits the parsed object on `structured_output`. That
@@ -535,6 +535,28 @@ mod tests {
         assert_eq!(usage.output_tokens, 70);
         assert_eq!(usage.total_tokens, 1177);
         assert_eq!(usage.cost_microusd, Some(500_000));
+    }
+
+    #[tokio::test]
+    async fn success_subtype_with_is_error_is_a_failure() {
+        let (tx, mut rx) = stream_channel::channel(4);
+        let mut state = StreamState::default();
+        assert!(
+            state
+                .handle_message(
+                    &json_value!({
+                        "type": "result", "subtype": "success", "is_error": true,
+                        "result": "API Error: service unavailable", "api_error_status": 503
+                    }),
+                    &tx
+                )
+                .await
+                .unwrap()
+        );
+        assert!(state.emitted_failure);
+        assert!(state.final_text.is_none());
+        assert!(matches!(rx.try_recv(), Ok(StreamEvent::Failed { error })
+            if error.contains("service unavailable") && error.contains(r#""status":503"#)));
     }
 
     #[tokio::test]
