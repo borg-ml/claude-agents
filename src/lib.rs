@@ -57,6 +57,20 @@ impl CommandSpec {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .kill_on_drop(true);
+        // Request host-only state events, as the upstream SDK does. Respect
+        // caller overrides; older CLIs simply ignore this environment variable.
+        if !self
+            .environment
+            .iter()
+            .any(|(key, _)| key == "CLAUDE_CODE_SDK_READS_SESSION_STATE")
+            && !self
+                .environment_remove
+                .iter()
+                .any(|key| key == "CLAUDE_CODE_SDK_READS_SESSION_STATE")
+            && std::env::var_os("CLAUDE_CODE_SDK_READS_SESSION_STATE").is_none()
+        {
+            command.env("CLAUDE_CODE_SDK_READS_SESSION_STATE", "1");
+        }
         for (key, value) in self.environment {
             command.env(key, value);
         }
@@ -103,11 +117,12 @@ pub enum ChatStreamControl {
         /// caller correlate consumption exactly. A fresh uuid is minted when
         /// absent.
         message_id: Option<String>,
-        /// Deliver as a priority `now` message: Claude Code (2.1.272+) ends the
-        /// running turn after the tool in flight (shell work is backgrounded,
-        /// not killed), then runs this message as its own turn so it is
-        /// answered immediately instead of after the current task. Older CLIs
-        /// ignore the field and fold the message in at the next boundary.
+        /// Deliver as a priority `now` message. Claude Code 2.1.286+ moves
+        /// running shell commands, agents and MCP calls to the background and
+        /// joins the running turn for human-origin messages. These SDK steers
+        /// do not claim human origin and retain the separate-turn abort path,
+        /// also used by versions 2.1.272–2.1.285.
+        /// Older CLIs ignore the field and consume it at the next boundary.
         preempt: bool,
         ack: tokio::sync::oneshot::Sender<Result<(), String>>,
     },
@@ -1258,6 +1273,10 @@ struct TurnMessageBoundary {
     /// Whether this CLI emits `command_lifecycle` at all. Older builds do not;
     /// for them a `result` stays terminal on its own.
     lifecycle_observed: bool,
+    session_state: Option<String>,
+    deferred_result: Option<Value>,
+    background_deadline: Option<tokio::time::Instant>,
+    background_ceiling: Option<std::time::Duration>,
 }
 
 /// `--mcp-config` entries the CLI skipped during validation (2.1.219+),
@@ -1308,6 +1327,35 @@ fn capture_init_capabilities(value: &Value, capabilities: &mut HashSet<String>) 
 }
 
 impl TurnMessageBoundary {
+    fn new(command: &CommandSpec) -> Self {
+        const KEY: &str = "CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS";
+        let raw = command
+            .environment
+            .iter()
+            .rev()
+            .find(|(key, _)| key == KEY)
+            .map(|(_, value)| value.clone())
+            .or_else(|| {
+                (!command.environment_remove.iter().any(|key| key == KEY))
+                    .then(|| std::env::var(KEY).ok())
+                    .flatten()
+            });
+        let ms = raw
+            .and_then(|raw| raw.parse::<u64>().ok())
+            .unwrap_or(600_000);
+        Self {
+            background_ceiling: (ms != 0)
+                .then(|| std::time::Duration::from_millis(ms.min(i32::MAX as u64))),
+            ..Self::default()
+        }
+    }
+
+    fn arm_background_ceiling(&mut self) {
+        self.background_deadline = self
+            .background_ceiling
+            .map(|duration| tokio::time::Instant::now() + duration);
+    }
+
     fn background_task_ids(&self) -> Vec<String> {
         self.live_background_tasks.iter().cloned().collect()
     }
@@ -1390,6 +1438,36 @@ impl TurnMessageBoundary {
     }
 
     fn classify(&mut self, value: &Value, input_ids: &HashSet<String>) -> TurnMessageAction {
+        // A task can finish just before the foreground result but still owe
+        // the parent another turn. Only the CLI's idle marker closes that race.
+        if value.get("type").and_then(Value::as_str) == Some("system")
+            && value.get("subtype").and_then(Value::as_str) == Some("session_state_changed")
+            && let Some(state) = value.get("state").and_then(Value::as_str)
+        {
+            self.session_state = Some(state.to_string());
+            if state == "idle" {
+                self.background_deadline = None;
+                if let Some(result) = self.deferred_result.as_ref()
+                    && !self.follow_up_pending(result)
+                {
+                    self.deferred_result = None;
+                    return TurnMessageAction::Terminal;
+                }
+            } else if state == "requires_action" {
+                self.background_deadline = None;
+            } else if self.deferred_result.is_some() {
+                self.arm_background_ceiling();
+            }
+            return TurnMessageAction::Forward;
+        }
+        if matches!(
+            value.get("type").and_then(Value::as_str),
+            Some("assistant" | "stream_event")
+        ) && !stream::is_subagent_message(value)
+        {
+            // The ceiling bounds only the wait between turns, not model work.
+            self.background_deadline = None;
+        }
         self.observe_lifecycle(value);
         if value.get("type").and_then(Value::as_str) == Some("system")
             && value.get("subtype").and_then(Value::as_str) == Some("background_tasks_changed")
@@ -1398,6 +1476,9 @@ impl TurnMessageBoundary {
             if let Some(tasks) = value.get("tasks").and_then(Value::as_array) {
                 self.live_background_tasks
                     .extend(tasks.iter().filter_map(|task| {
+                        if task.get("ambient").and_then(Value::as_bool) == Some(true) {
+                            return None;
+                        }
                         task.get("task_id")
                             .and_then(Value::as_str)
                             .map(str::to_string)
@@ -1408,6 +1489,24 @@ impl TurnMessageBoundary {
 
         if value.get("type").and_then(Value::as_str) != Some("result") {
             return TurnMessageAction::Forward;
+        }
+
+        if self
+            .session_state
+            .as_deref()
+            .is_some_and(|state| state != "idle")
+            && (message_belongs_to_turn(value, input_ids) || self.deferred_result.is_some())
+        {
+            self.deferred_result = Some(value.clone());
+            self.awaiting_post_background_result = true;
+            if self.session_state.as_deref() != Some("requires_action") {
+                self.arm_background_ceiling();
+            }
+            return if self.follow_up_pending(value) {
+                self.pending_result_action(value)
+            } else {
+                TurnMessageAction::Forward
+            };
         }
 
         if self.awaiting_post_background_result && self.live_background_tasks.is_empty() {
@@ -1494,6 +1593,7 @@ pub async fn run(
 
     let _runtime_directory = req.runtime_directory.clone();
     let started_at = std::time::Instant::now();
+    let mut turn_boundary = TurnMessageBoundary::new(&req.command);
     let program = req.command.program.clone();
     let mut child = ClaudeChild(
         req.command
@@ -1543,7 +1643,6 @@ pub async fn run(
     )
     .await?;
 
-    let mut turn_boundary = TurnMessageBoundary::default();
     let (initial_input_id, initial_message) =
         user_message_with_id(prompt_content(&req.prompt, &req.attachments));
     turn_boundary.note_input(&initial_input_id);
@@ -1561,6 +1660,12 @@ pub async fn run(
         let context_deadline_at = context_deadline;
         tokio::select! {
             biased;
+            _ = tokio::time::sleep_until(
+                turn_boundary.background_deadline.unwrap_or_else(tokio::time::Instant::now)
+            ), if turn_boundary.background_deadline.is_some() => {
+                // Do not return a possibly active process to the pool.
+                bail!("Claude session did not become idle before the background wait ceiling");
+            }
             _ = tokio::time::sleep_until(
                 context_deadline_at.unwrap_or_else(tokio::time::Instant::now)
             ), if terminal_seen && channel.has_pending_context_usage() => {
@@ -1590,7 +1695,9 @@ pub async fn run(
                         if action == TurnMessageAction::Suppress {
                             continue;
                         }
-                        send_provider_event(&tx, &value).await;
+                        if value.get("sdk_host_only").and_then(Value::as_bool) != Some(true) {
+                            send_provider_event(&tx, &value).await;
+                        }
                         let state_ended = state.handle_message(&value, &tx).await?;
                         if value.get("type").and_then(Value::as_str) == Some("assistant")
                             && !state_ended
@@ -1812,6 +1919,7 @@ struct PooledClaudeNative {
     lifecycle_key: String,
     started: bool,
     capabilities: HashSet<String>,
+    live_background_tasks: HashSet<String>,
     session_id: Option<String>,
     pending_steers: Vec<(String, Value)>,
     /// The command line the process was spawned with, updated when a model or
@@ -1924,6 +2032,7 @@ async fn start_pooled_native(req: &ChatStreamRequest) -> Result<PooledClaudeNati
         lifecycle_key: req.lifecycle_key.clone(),
         started: false,
         capabilities: HashSet::new(),
+        live_background_tasks: HashSet::new(),
         session_id: None,
         pending_steers: Vec::new(),
         command: req.command.clone(),
@@ -2100,7 +2209,8 @@ async fn run_pooled_native_turn(
         .await?;
         pooled.started = true;
     }
-    let mut turn_boundary = TurnMessageBoundary::default();
+    let mut turn_boundary = TurnMessageBoundary::new(&req.command);
+    turn_boundary.live_background_tasks = pooled.live_background_tasks.clone();
     let (input_id, message) = user_message_with_id(prompt_content(&req.prompt, &req.attachments));
     turn_boundary.note_input(&input_id);
     let mut input_ids = HashSet::from([input_id]);
@@ -2126,6 +2236,12 @@ async fn run_pooled_native_turn(
         let context_deadline_at = context_deadline;
         tokio::select! {
             biased;
+            _ = tokio::time::sleep_until(
+                turn_boundary.background_deadline.unwrap_or_else(tokio::time::Instant::now)
+            ), if turn_boundary.background_deadline.is_some() => {
+                // Do not return a possibly active process to the pool.
+                bail!("Claude session did not become idle before the background wait ceiling");
+            }
             _ = tokio::time::sleep_until(
                 context_deadline_at.unwrap_or_else(tokio::time::Instant::now)
             ), if terminal_seen && channel.has_pending_context_usage() => {
@@ -2156,10 +2272,13 @@ async fn run_pooled_native_turn(
                         capture_init_capabilities(&value, &mut pooled.capabilities);
                         report_mcp_server_errors(tx, &value).await;
                         let action = turn_boundary.classify(&value, &input_ids);
+                        pooled.live_background_tasks = turn_boundary.live_background_tasks.clone();
                         if action == TurnMessageAction::Suppress {
                             continue;
                         }
-                        send_provider_event(tx, &value).await;
+                        if value.get("sdk_host_only").and_then(Value::as_bool) != Some(true) {
+                            send_provider_event(tx, &value).await;
+                        }
                         let state_ended = state.handle_message(&value, tx).await?;
                         if value.get("type").and_then(Value::as_str) == Some("assistant")
                             && !state_ended
@@ -2806,6 +2925,119 @@ mod tests {
         );
     }
 
+    fn session_state(state: &str) -> Value {
+        json!({"type": "system", "subtype": "session_state_changed", "state": state})
+    }
+
+    #[test]
+    fn interrupted_result_without_a_follow_up_is_not_suppressed() {
+        let mut boundary = TurnMessageBoundary::default();
+        let inputs = HashSet::from(["prompt".to_string()]);
+        boundary.classify(&session_state("running"), &inputs);
+        let aborted = json!({"type": "result", "subtype": "error_during_execution",
+            "user_message_uuid": "prompt", "terminal_reason": "aborted_streaming"});
+        assert_eq!(
+            boundary.classify(&aborted, &inputs),
+            TurnMessageAction::Forward
+        );
+    }
+
+    #[test]
+    fn idle_is_authoritative_even_with_background_shells() {
+        let mut boundary = TurnMessageBoundary::default();
+        let inputs = HashSet::from(["prompt".to_string()]);
+        boundary.classify(&session_state("running"), &inputs);
+        boundary.classify(
+            &json!({"type": "system", "subtype": "background_tasks_changed",
+            "tasks": [{"task_id": "watcher", "ambient": true}, {"task_id": "shell"}]}),
+            &inputs,
+        );
+        assert_eq!(boundary.background_task_ids(), vec!["shell".to_string()]);
+        boundary.classify(&result_for("prompt"), &inputs);
+        assert_eq!(
+            boundary.classify(&session_state("idle"), &inputs),
+            TurnMessageAction::Terminal
+        );
+    }
+
+    #[test]
+    fn completed_background_task_still_waits_for_session_idle() {
+        let mut boundary = TurnMessageBoundary::default();
+        let inputs = HashSet::from(["prompt".to_string()]);
+        boundary.classify(&session_state("running"), &inputs);
+        boundary.classify(
+            &json!({"type": "system", "subtype": "background_tasks_changed", "tasks": []}),
+            &inputs,
+        );
+        assert_eq!(
+            boundary.classify(&result_for("prompt"), &inputs),
+            TurnMessageAction::Forward
+        );
+        // Completion wakes an internal turn with a different UUID.
+        assert_eq!(
+            boundary.classify(&result_for("notification"), &inputs),
+            TurnMessageAction::Forward
+        );
+        assert_eq!(
+            boundary.classify(&session_state("idle"), &inputs),
+            TurnMessageAction::Terminal
+        );
+    }
+
+    #[test]
+    fn idle_before_result_and_pending_steers_keep_their_boundaries() {
+        let mut boundary = TurnMessageBoundary::default();
+        let inputs = HashSet::from(["prompt".to_string(), "steer".to_string()]);
+        boundary.note_input("prompt");
+        boundary.note_input("steer");
+        boundary.classify(&lifecycle("prompt", "started"), &inputs);
+        boundary.classify(&lifecycle("steer", "queued"), &inputs);
+        boundary.classify(&session_state("running"), &inputs);
+        boundary.classify(&result_for("prompt"), &inputs);
+        assert_eq!(
+            boundary.classify(&session_state("idle"), &inputs),
+            TurnMessageAction::Forward
+        );
+        boundary.classify(&lifecycle("prompt", "completed"), &inputs);
+        boundary.classify(&lifecycle("steer", "completed"), &inputs);
+        assert_eq!(
+            boundary.classify(&result_for("steer"), &inputs),
+            TurnMessageAction::Terminal
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn background_wait_ceiling_respects_child_environment() {
+        let root = tempfile::tempdir().unwrap();
+        let mut command = fake_command(root.path());
+        let inputs = HashSet::from(["prompt".to_string()]);
+        command
+            .environment
+            .push(("CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS".into(), "25".into()));
+        let mut boundary = TurnMessageBoundary::new(&command);
+        boundary.classify(&session_state("running"), &inputs);
+        boundary.classify(&result_for("prompt"), &inputs);
+        assert!(boundary.background_deadline.is_some());
+        boundary.classify(&session_state("requires_action"), &inputs);
+        assert!(boundary.background_deadline.is_none());
+        boundary.classify(&session_state("running"), &inputs);
+        assert!(boundary.background_deadline.is_some());
+        boundary.classify(&json!({"type": "assistant", "message": {}}), &inputs);
+        assert!(boundary.background_deadline.is_none());
+        command.environment[0].1 = "0".into();
+        assert!(
+            TurnMessageBoundary::new(&command)
+                .background_ceiling
+                .is_none()
+        );
+        command.environment[0].1 = "invalid".into();
+        assert_eq!(
+            TurnMessageBoundary::new(&command).background_ceiling,
+            Some(std::time::Duration::from_secs(600))
+        );
+    }
+
     #[test]
     fn cli_without_command_lifecycle_still_ends_on_the_result() {
         let mut boundary = TurnMessageBoundary::default();
@@ -3030,12 +3262,15 @@ while IFS= read -r line; do
       ;;
     *'"type":"user"'*)
       turn=$((turn + 1))
+      printf '{"type":"system","subtype":"session_state_changed","state":"running","sdk_host_only":true}\n'
       printf '{"type":"system","subtype":"background_tasks_changed","tasks":[{"task_id":"test-task"}]}\n'
       printf '{"type":"system","subtype":"background_tasks_changed","tasks":[]}\n'
       printf '{"type":"system","subtype":"init","session_id":"session-test","capabilities":["interrupt_receipt_v1","interrupt_cancel_queued_v1"]}\n'
       printf '{"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"turn-%s"}}}\n' "$turn"
       printf '{"type":"assistant","session_id":"session-test","message":{"content":[{"type":"text","text":"turn-%s"}],"usage":{"input_tokens":1,"output_tokens":2}}}\n' "$turn"
+      printf '{"type":"result","subtype":"success","result":"foreground-only","session_id":"session-test"}\n'
       printf '{"type":"result","subtype":"success","result":"turn-%s","session_id":"session-test","usage":{"input_tokens":1,"output_tokens":2},"total_cost_usd":0.001}\n' "$turn"
+      printf '{"type":"system","subtype":"session_state_changed","state":"idle","sdk_host_only":true}\n'
       ;;
   esac
 done
@@ -3067,6 +3302,45 @@ done
             }
         }
         panic!("fake Claude ended without a terminal event");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn background_wait_timeout_discards_direct_and_pooled_processes() {
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            let root = tempfile::tempdir().unwrap();
+            let mut command = fake_command(root.path());
+            let script = std::fs::read_to_string(&command.program).unwrap();
+            std::fs::write(
+                &command.program,
+                script
+                    .lines()
+                    .filter(|line| {
+                        !line.contains("session_state_changed") || !line.contains("idle")
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n")
+                    + "\n",
+            )
+            .unwrap();
+            command
+                .environment
+                .push(("CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS".into(), "25".into()));
+            let (tx, _rx) = tokio::sync::mpsc::channel(64);
+            let error = run(fake_request(root.path(), command.clone()), tx, None)
+                .await
+                .unwrap_err();
+            assert!(error.to_string().contains("background wait ceiling"));
+            let pool = ClaudePool::default();
+            let (tx, _rx) = tokio::sync::mpsc::channel(64);
+            let error = run_pooled(fake_request(root.path(), command), tx, None, pool.clone())
+                .await
+                .unwrap_err();
+            assert!(error.to_string().contains("background wait ceiling"));
+            assert!(pool.inner.lock().await.is_none());
+        })
+        .await
+        .expect("background wait is bounded");
     }
 
     #[cfg(unix)]
