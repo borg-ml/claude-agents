@@ -21,12 +21,25 @@ licensed; Claude Code itself remains Anthropic software and is not included.
 
 ## Upstream compatibility
 
-Protocol reviewed against upstream HEAD on 2026-09-30:
+Protocol source-reviewed against upstream HEAD on 2026-10-20:
 
-- [Python SDK 0.2.163](https://github.com/anthropics/claude-agent-sdk-python/commit/1ef6d8c71bb0e44a6b33fe61497864f21e17fdb7)
-- [TypeScript SDK 0.3.286](https://github.com/anthropics/claude-agent-sdk-typescript/commit/0e21ebb22c36caca1220c34ae6c9fe8ddad40e47)
-- Both target Claude Code **2.1.286**. The binary is supplied by the caller,
+- [Python SDK 0.2.168 (HEAD)](https://github.com/anthropics/claude-agent-sdk-python/commit/c01a99416a02805b0a050d058da51bde53f6df64)
+- [TypeScript SDK 0.3.304](https://github.com/anthropics/claude-agent-sdk-typescript/commit/b8060fa5ac705b8f69ea32aafd21d32a9851000e)
+- Both upstream HEADs target Claude Code **2.1.304** (Python's latest changelog
+  release, 0.2.168, bundles 2.1.301). The binary is supplied by the caller,
   not installed or upgraded by this crate.
+
+The 2.1.287–2.1.304 source review found no required wire-runtime changes: Python's
+query, transport and message parser are unchanged. New task ancestry/run ids,
+subagent `agent_id`, rate-limit metadata and initialization fields remain
+available in raw provider events; subagent frames still carry
+`parent_tool_use_id`. MCP elicitation `property_order` is preserved in the
+interaction payload alongside the normalized `requestedSchema`, so hosts need
+not rely on JSON object key order. New CLI defaults (including fork subagents
+and permission mode) remain caller-owned; pass explicit configuration when
+those defaults are not desired. Non-interactive CLI sessions omit thinking
+text by default; callers needing reasoning events should configure
+`--thinking-display summarized`.
 
 The runtime requests SDK host session-state events and keeps the control
 channel open until Claude reports idle, including follow-up turns woken by
